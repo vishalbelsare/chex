@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for `fake.py`."""
 
+import dataclasses
 import functools
 
 from absl.testing import absltest
@@ -72,10 +73,7 @@ def _assert_pmapped(fn, fn_input, is_pmapped, should_jit=False):
   # the function output, if it is a sharded array type then the function has
   # been pmapped
   if is_pmapped:
-    if jax.config.jax_array:
-      expected_type = jax.Array
-    else:
-      expected_type = ArraySharded
+    expected_type = jax.Array
     assert_message = f'Output is type {type(output)}, expected {expected_type}'
     assert isinstance(output, expected_type), assert_message
   else:
@@ -83,12 +81,8 @@ def _assert_pmapped(fn, fn_input, is_pmapped, should_jit=False):
     assert_message = f'Output is type {type(output)}, expected {expected_type}'
     # ShardedDeviceArray is a subclass of DeviceArray. So, to enforce we have
     # a DeviceArray, we also check it's not a sharded one.
-    if jax.config.jax_array:
-      assert (isinstance(output, jax.Array) and
-              len(output.sharding.device_set) == 1), assert_message
-    else:
-      assert (isinstance(output, jax.Array) and
-              not isinstance(output, ArraySharded)), assert_message
+    assert (isinstance(output, jax.Array) and
+            len(output.sharding.device_set) == 1), assert_message
 
 
 class PmapFakeTest(parameterized.TestCase):
@@ -103,9 +97,6 @@ class PmapFakeTest(parameterized.TestCase):
     # output is sharded or not is not correct. With jax.Array, you can check
     # the `len(output.sharding.device_set)` to see if its sharded or not, but
     # here because of a single device it fails.
-    if not jax.config.jax_array:
-      with self.assertRaises(AssertionError):
-        _assert_pmapped(foo, fn_input, False)
 
   def test_assert_jitted(self):
     fn_input = jnp.ones((4,))
@@ -241,11 +232,20 @@ class PmapFakeTest(parameterized.TestCase):
 
       # Note: mode='bar' is intended to test that we correctly handle kwargs
       # with defaults for which we don't pass a value at call time.
-      @functools.partial(jax.pmap,
-                         axis_size=num_devices,
-                         static_broadcasted_argnums=static_argnums)
-      @jax.jit
+      @functools.partial(
+          jax.pmap,
+          axis_size=num_devices,
+          static_broadcasted_argnums=static_argnums,
+      )
+      @functools.partial(
+          jax.jit,
+          static_argnums=static_argnums,
+      )
       def foo(x, multiplier, y, mode='bar'):
+        if static_argnums == 1 or 1 in static_argnums:
+          # Verify that the static arguments are not replaced with tracers.
+          self.assertIsInstance(multiplier, int)
+
         if mode == 'bar':
           return (x * multiplier) + y
         else:
@@ -254,7 +254,7 @@ class PmapFakeTest(parameterized.TestCase):
       # pmap over all available devices
       inputs = jnp.array([1, 2])
       inputs = jnp.broadcast_to(inputs, (num_devices,) + inputs.shape)
-      func = lambda: foo(inputs, 100, inputs)   # Pass multiplier=100.
+      func = lambda: foo(inputs, 100, inputs)  # Pass multiplier=100.
 
       if static_argnums == 1:  # Should work.
         expected = jnp.broadcast_to(jnp.array([101, 202]), (num_devices, 2))
@@ -263,6 +263,50 @@ class PmapFakeTest(parameterized.TestCase):
       else:  # Should error.
         with self.assertRaises(ValueError):
           result = func()
+
+  @parameterized.parameters(1, [1])
+  def test_pmap_with_complex_static_broadcasted_object(self, static_argnums):
+
+    @dataclasses.dataclass
+    class Multiplier:
+      x: int
+      y: int
+
+    def foo(x, multiplier, y):
+      if static_argnums == 1 or 1 in static_argnums:
+        # Verify that the static arguments are not replaced with tracers.
+        self.assertIsInstance(multiplier, Multiplier)
+
+      return x * multiplier.x + y * multiplier.y
+
+    with fake.fake_pmap_and_jit():
+      num_devices = jax.device_count()
+
+      # pmap over all available devices
+      transformed_foo = jax.pmap(
+          foo,
+          axis_size=num_devices,
+          static_broadcasted_argnums=static_argnums,
+      )
+      x, y = jax.random.randint(
+          jax.random.PRNGKey(27), (2, num_devices, 3, 5), 0, 10
+      )
+
+      # Test 1.
+      mult = Multiplier(x=2, y=7)
+      asserts.assert_trees_all_equal(
+          transformed_foo(x, mult, y),
+          foo(x, mult, y),
+          x * mult.x + y * mult.y,
+      )
+
+      # Test 2.
+      mult = Multiplier(x=72, y=21)
+      asserts.assert_trees_all_equal(
+          transformed_foo(x, mult, y),
+          foo(x, mult, y),
+          x * mult.x + y * mult.y,
+      )
 
   @parameterized.named_parameters([
       ('fake_nothing', False, False),

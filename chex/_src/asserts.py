@@ -19,21 +19,23 @@ import collections.abc
 import functools
 import inspect
 import traceback
-from typing import Any, Callable, List, Optional, Sequence, Set, Type, Union, cast
+from typing import Any, Callable, List, Optional, Sequence, Set, Union, cast
 import unittest
 from unittest import mock
 
 from chex._src import asserts_internal as _ai
 from chex._src import pytypes
 import jax
+from jax.experimental import checkify
 import jax.numpy as jnp
 import jax.test_util as jax_test
 import numpy as np
-import tree as dm_tree
 
 Scalar = pytypes.Scalar
 Array = pytypes.Array
+ArrayDType = pytypes.ArrayDType  # pylint:disable=invalid-name
 ArrayTree = pytypes.ArrayTree
+
 
 _value_assertion = _ai.chex_assertion
 _static_assertion = functools.partial(
@@ -143,7 +145,7 @@ def assert_max_traces(fn: Optional[Union[Callable[..., Any], int]] = None,
 
     nonlocal fn_hash
     _ai.TRACE_COUNTER[fn_hash] += int(has_tracers_in_args)
-    if _ai.TRACE_COUNTER[fn_hash] > n:
+    if not _ai.DISABLE_ASSERTIONS and _ai.TRACE_COUNTER[fn_hash] > n:
       raise AssertionError(
           f"{_ai.ERR_PREFIX}Function '{fn.__name__}' is traced > {n} times!\n"
           "It often happens when a jitted function is defined inside another "
@@ -151,7 +153,7 @@ def assert_max_traces(fn: Optional[Union[Callable[..., Any], int]] = None,
           "new object every time). Make sure that your code does not exploit "
           "this pattern (move the nested functions to the top level to fix it)."
           " See `chex.clear_trace_counter()` if `@chex.assert_max_traces` is "
-          "used in unittests.")
+          "used in any unit tests (especially @parameterized tests).")
 
     return fn(*args, **kwargs)
 
@@ -365,6 +367,87 @@ def assert_scalar_negative(x: Scalar) -> None:
 
 
 @_static_assertion
+def assert_equal_size(inputs: Sequence[Array]) -> None:
+  """Checks that all arrays have the same size.
+
+  Args:
+    inputs: A collection of arrays.
+
+  Raises:
+    AssertionError: If the size of all arrays do not match.
+  """
+  _ai.assert_collection_of_arrays(inputs)
+  size = inputs[0].size
+  expected_sizes = [size] * len(inputs)
+  sizes = [x.size for x in inputs]
+  if sizes != expected_sizes:
+    raise AssertionError(f"Arrays have different sizes: {sizes}")
+
+
+@_static_assertion
+def assert_size(
+    inputs: Union[Scalar, Union[Array, Sequence[Array]]],
+    expected_sizes: Union[_ai.TShapeMatcher,
+                          Sequence[_ai.TShapeMatcher]]) -> None:
+  """Checks that the size of all inputs matches specified ``expected_sizes``.
+  
+  Valid usages include:
+
+  .. code-block:: python
+
+    assert_size(x, 1)                   # x is scalar (size 1)
+    assert_size([x, y], (2, {1, 3}))    # x has size 2, y has size 1 or 3
+    assert_size([x, y], (2, ...))       # x has size 2, y has any size
+    assert_size([x, y], 1)              # x and y are scalar (size 1)
+    assert_size((x, y), (5, 2))         # x has size 5, y has size 2
+
+  Args:
+    inputs: An array or a sequence of arrays.
+    expected_sizes: A sqeuence of expected sizes associated with each input,
+      where the expected size is a sequence of integer and `None` dimensions;
+      if all inputs have same size, a single size may be passed as 
+      ``expected_sizes``.
+
+  Raises:
+    AssertionError: If the lengths of ``inputs`` and ``expected_sizes`` do not
+      match; if ``expected_sizes`` has wrong type; if size of ``input`` does
+      not match ``expected_sizes``.
+  """
+  # Ensure inputs and expected sizes are sequences.
+  if not isinstance(inputs, collections.abc.Sequence):
+    inputs = [inputs]
+
+  if isinstance(expected_sizes, int):
+    expected_sizes = [expected_sizes] * len(inputs)
+
+  if not isinstance(expected_sizes, (list, tuple)):
+    raise AssertionError(
+        "Error in size compatibility check: expected sizes should be an int, "
+        f"list, or tuple of ints, got {expected_sizes}.")
+
+  if len(inputs) != len(expected_sizes):
+    raise AssertionError(
+        "Length of `inputs` and `expected_sizes` must match: "
+        f"{len(inputs)} is not equal to {len(expected_sizes)}.")
+
+  errors = []
+  for idx, (x, expected) in enumerate(zip(inputs, expected_sizes)):
+    size = getattr(x, "size", 1)  # scalars have size 1 by definition.
+    # Allow any size for the ellipsis case and allow handling of integer
+    # expected sizes or collection of acceptable expected sizes.
+    int_condition = expected in {Ellipsis, None} or size == expected
+    set_condition = (isinstance(expected, collections.abc.Collection) and
+                     size in expected)
+    if not (int_condition or set_condition):
+      errors.append((idx, size, expected))
+
+  if errors:
+    msg = "; ".join(
+        f"input {e[0]} has size {e[1]} but expected {e[2]}" for e in errors)
+    raise AssertionError(f"Error in size compatibility check: {msg}.")
+
+
+@_static_assertion
 def assert_equal_shape(
     inputs: Sequence[Array],
     *,
@@ -474,8 +557,8 @@ def _shape_matches(actual_shape: Sequence[int],
                    expected_shape: _ai.TShapeMatcher) -> bool:
   """Returns True if `actual_shape` is compatible with `expected_shape`."""
   # Splits `expected_shape` based on the position of the ellipsis, if present.
-  expected_prefix: List[Union[int, Set[int]]] = []
-  expected_suffix: Optional[List[Union[int, Set[int]]]] = None
+  expected_prefix: List[_ai.TDimMatcher] = []
+  expected_suffix: Optional[List[_ai.TDimMatcher]] = None
   for dim in expected_shape:
     if dim is Ellipsis:
       if expected_suffix is not None:
@@ -541,9 +624,10 @@ def assert_shape(
       match; if ``expected_shapes`` has wrong type; if shape of ``input`` does
       not match ``expected_shapes``.
   """
-  if isinstance(expected_shapes, (np.ndarray, Array)):
-    raise AssertionError("Error in shape compatibility check: "
-                         "expected shapes should be a list or tuple of ints.")
+  if not isinstance(expected_shapes, (list, tuple)):
+    raise AssertionError(
+        "Error in shape compatibility check: expected shapes should be a list "
+        f"or tuple of ints, got {expected_shapes}.")
 
   # Ensure inputs and expected shapes are sequences.
   if not isinstance(inputs, collections.abc.Sequence):
@@ -645,10 +729,16 @@ def assert_rank(
     ValueError: If ``expected_ranks`` is not an integer and not a sequence of
      integets.
   """
-  if isinstance(expected_ranks, (np.ndarray, Array)):
+  if not isinstance(expected_ranks, (collections.abc.Collection, int)):
     raise ValueError(
-        f"Error in rank compatibility check: expected ranks should "
-        f"be a collection of integers but was an array: {expected_ranks}.")
+        f"Error in rank compatibility check: expected ranks should be a single "
+        f"integer or a collection of integers, got {expected_ranks}.")
+
+  if isinstance(expected_ranks, np.ndarray):  # ndarray is abc.Collection
+    raise ValueError(
+        f"Error in rank compatibility check: expected ranks should be a single "
+        f"integer or a collection of integers, but was an array: "
+        f"{expected_ranks}.")
 
   # Ensure inputs and expected ranks are sequences.
   if not isinstance(inputs, collections.abc.Sequence):
@@ -694,10 +784,14 @@ def assert_rank(
 @_static_assertion
 def assert_type(
     inputs: Union[Scalar, Union[Array, Sequence[Array]]],
-    expected_types: Union[Type[Scalar], Sequence[Type[Scalar]]]) -> None:
+    expected_types: Union[ArrayDType, Sequence[ArrayDType]]) -> None:
   """Checks that the type of all inputs matches specified ``expected_types``.
 
-  Valid usages include:
+  If the expected type is a Python type or abstract dtype (e.g. `np.floating`),
+  assert that the input has the same sub-type. If the expected type is a
+  concrete dtype (e.g. np.float32), assert that the input's type is the same.
+
+  Example usage:
 
   .. code-block:: python
 
@@ -708,8 +802,9 @@ def assert_type(
     assert_type([7, 7.1], [int, float])
     assert_type(np.array(7), int)
     assert_type(np.array(7.1), float)
-    assert_type(jnp.array(7), int)
     assert_type([jnp.array([7, 8]), np.array(7.1)], [int, float])
+    assert_type(jnp.array(1., dtype=jnp.bfloat16)), jnp.bfloat16)
+    assert_type(jnp.ones(1, dtype=np.int8), np.int8)
 
   Args:
     inputs: An array or a sequence of arrays or scalars.
@@ -729,21 +824,22 @@ def assert_type(
 
   errors = []
   if len(inputs) != len(expected_types):
-    raise AssertionError(f"Length of `inputs` and `expected_types` must match, "
-                         f"got {len(inputs)} != {len(expected_types)}.")
+    raise AssertionError(
+        "Length of `inputs` and `expected_types` must match, "
+        f"got {len(inputs)} != {len(expected_types)}."
+    )
   for idx, (x, expected) in enumerate(zip(inputs, expected_types)):
-    if jnp.issubdtype(expected, jnp.floating):
-      parent = jnp.floating
-    elif jnp.issubdtype(expected, jnp.integer):
-      parent = jnp.integer
-    elif jnp.issubdtype(expected, jnp.bool_):
-      parent = jnp.bool_
+    dtype = np.result_type(x)
+    if expected in {float, jnp.floating}:
+      if not jnp.issubdtype(dtype, jnp.floating):
+        errors.append((idx, dtype, expected))
+    elif expected in {int, jnp.integer}:
+      if not jnp.issubdtype(dtype, jnp.integer):
+        errors.append((idx, dtype, expected))
     else:
-      raise AssertionError(
-          f"Error in type compatibility check, unsupported dtype '{expected}'.")
-
-    if not jnp.issubdtype(jnp.result_type(x), parent):
-      errors.append((idx, jnp.result_type(x), expected))
+      expected = np.dtype(expected)
+      if dtype != expected:
+        errors.append((idx, dtype, expected))
 
   if errors:
     msg = "; ".join(
@@ -771,7 +867,8 @@ def assert_axis_dimension_comparator(tensor: Array, axis: int,
   Raises:
     AssertionError: if `pass_fn(tensor.shape[axis], val)` does not return true.
   """
-  tensor = jnp.asarray(tensor)
+  if not isinstance(tensor, (jax.Array, np.ndarray)):
+    tensor = np.asarray(tensor)  # np is broader than jnp (it supports strings)
   if axis >= len(tensor.shape) or axis < -len(tensor.shape):
     raise AssertionError(
         f"Expected tensor to have dim {error_string} on axis "
@@ -919,35 +1016,29 @@ def assert_tree_no_nones(tree: ArrayTree) -> None:
   Raises:
     AssertionError: If the tree contains at least one `None`.
   """
-  errors = []
+  has_nones = False
 
-  def _assert_fn(path, leaf):
-    if leaf is None:
-      nonlocal errors
-      errors.append(f"`None` detected at '{_ai.format_tree_path(path)}'.")
+  def _is_leaf(value):
+    if value is None:
+      nonlocal has_nones
+      has_nones = True
+    return False
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
-  if errors:
-    raise AssertionError("\n".join(errors))
+  treedef = jax.tree_util.tree_structure(tree, is_leaf=_is_leaf)
+  if has_nones:
+    raise AssertionError(f"Tree contains `None`(s): {treedef}.")
 
 
 @_static_assertion
-def assert_tree_has_only_ndarrays(tree: ArrayTree,
-                                  *,
-                                  ignore_nones: bool = False) -> None:
+def assert_tree_has_only_ndarrays(tree: ArrayTree) -> None:
   """Checks that all `tree`'s leaves are n-dimensional arrays (tensors).
 
   Args:
     tree: A tree to assert.
-    ignore_nones: Whether to ignore `None` in the tree.
 
   Raises:
     AssertionError: If the tree contains an object which is not an ndarray.
   """
-  if not ignore_nones:
-    assert_tree_no_nones(tree)
-
   errors = []
 
   def _assert_fn(path, leaf):
@@ -957,8 +1048,8 @@ def assert_tree_has_only_ndarrays(tree: ArrayTree,
         errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' is not an "
                        f"ndarray (type={type(leaf)})."))
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
@@ -968,19 +1059,27 @@ def assert_tree_has_only_ndarrays(tree: ArrayTree,
 # jax version >= 0.3.22.
 # This is for backwards compatibility.
 def _check_sharding(x):
-  if jax.config.jax_array and isinstance(x, jax.Array):
+  if hasattr(jax, "Array") and isinstance(x, jax.Array):
     if isinstance(x.sharding, jax.sharding.PmapSharding):
       return True
     else:
       return len(x.sharding.device_set) > 1
-  return isinstance(x, jax.pxla.ShardedDeviceArray)
+  # pytype: disable=attribute-error
+  return (
+      hasattr(jax, "pxla")
+      and hasattr(jax.pxla, "ShardedDeviceArray")
+      and isinstance(x, jax.pxla.ShardedDeviceArray)
+  )
+  # pytype: enable=attribute-error
 
 
 @_static_assertion
-def assert_tree_is_on_host(tree: ArrayTree,
-                           *,
-                           allow_cpu_device: bool = True,
-                           ignore_nones: bool = False) -> None:
+def assert_tree_is_on_host(
+    tree: ArrayTree,
+    *,
+    allow_cpu_device: bool = True,
+    allow_sharded_arrays: bool = False,
+) -> None:
   """Checks that all leaves are ndarrays residing in the host memory (on CPU).
 
   This assertion only accepts trees consisting of ndarrays.
@@ -988,13 +1087,15 @@ def assert_tree_is_on_host(tree: ArrayTree,
   Args:
     tree: A tree to assert.
     allow_cpu_device: Whether to allow JAX arrays that reside on a CPU device.
-    ignore_nones: Whether to ignore `None` in the tree.
+    allow_sharded_arrays: Whether to allow sharded JAX arrays. Sharded arrays
+      are considered "on host" only if they are sharded across CPU devices and
+      `allow_cpu_device` is `True`.
 
   Raises:
     AssertionError: If the tree contains a leaf that is not an ndarray or does
       not reside on host.
   """
-  assert_tree_has_only_ndarrays(tree, ignore_nones=ignore_nones)
+  assert_tree_has_only_ndarrays(tree)
   errors = []
 
   def _assert_fn(path, leaf):
@@ -1002,20 +1103,48 @@ def assert_tree_is_on_host(tree: ArrayTree,
       if not isinstance(leaf, np.ndarray):
         nonlocal errors
 
-        if isinstance(leaf, jax.Array) and not _check_sharding(leaf):
-          if allow_cpu_device:
-            if leaf.device().platform != "cpu":
-              errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' resides"
-                             f" on {leaf.device()}."))
+        if isinstance(leaf, jax.Array):
+          if _check_sharding(leaf):
+            # Sharded array.
+            if not allow_sharded_arrays:
+              errors.append(
+                  f"Tree leaf '{_ai.format_tree_path(path)}' is sharded and"
+                  f" resides on {leaf.devices()} (sharded arrays are"
+                  " disallowed)."
+              )
+            elif allow_cpu_device:
+              if any(d.platform != "cpu" for d in leaf.devices()):
+                errors.append(
+                    f"Tree leaf '{_ai.format_tree_path(path)}' is sharded and"
+                    f" resides on {leaf.devices()}."
+                )
+            else:
+              errors.append(
+                  f"Tree leaf '{_ai.format_tree_path(path)}' is sharded and"
+                  f" resides on {leaf.devices()} (CPU devices are disallowed)."
+              )
+          elif allow_cpu_device:
+            # Device array.
+            leaf_device = list(leaf.devices())[0]
+            if leaf_device.platform != "cpu":
+              errors.append(
+                  f"Tree leaf '{_ai.format_tree_path(path)}' resides"
+                  f" on {leaf_device}."
+              )
           else:
-            errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' resides "
-                           f"on {leaf.device()} (CPU devices are disallowed)."))
-        else:  # not a DeviceArray
-          errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' has "
-                         f"unexpected type: {type(leaf)}."))
+            errors.append((
+                f"Tree leaf '{_ai.format_tree_path(path)}' resides "
+                f"on {leaf.devices()} (CPU devices are disallowed)."
+            ))
+        else:
+          # Not a jax.Array.
+          errors.append((
+              f"Tree leaf '{_ai.format_tree_path(path)}' has "
+              f"unexpected type: {type(leaf)}."
+          ))
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
@@ -1025,8 +1154,7 @@ def assert_tree_is_on_device(tree: ArrayTree,
                              *,
                              platform: Union[Sequence[str],
                                              str] = ("gpu", "tpu"),
-                             device: Optional[pytypes.Device] = None,
-                             ignore_nones: bool = False) -> None:
+                             device: Optional[pytypes.Device] = None) -> None:
   """Checks that all leaves are ndarrays residing in device memory (in HBM).
 
   Sharded DeviceArrays are disallowed.
@@ -1037,13 +1165,12 @@ def assert_tree_is_on_device(tree: ArrayTree,
       reside. Ignored if `device` is specified.
     device: An optional device where the tree's arrays are expected to reside.
       Any device (except CPU) is accepted if not specified.
-    ignore_nones: Whether to ignore `None` in the tree.
 
   Raises:
     AssertionError: If the tree contains a leaf that is not an ndarray or does
       not reside on the specified device or platform.
   """
-  assert_tree_has_only_ndarrays(tree, ignore_nones=ignore_nones)
+  assert_tree_has_only_ndarrays(tree)
 
   # If device is specified, require its platform.
   if device is not None:
@@ -1065,22 +1192,25 @@ def assert_tree_is_on_device(tree: ArrayTree,
                          f" (type={type(leaf)})."))
         else:  # DeviceArray and not ShardedDeviceArray
           # Check the platform.
-          if leaf.device().platform not in platform:
-            errors.append(
-                (f"Tree leaf '{_ai.format_tree_path(path)}' resides on "
-                 f"'{leaf.device().platform}', expected '{platform}'."))
+          leaf_device = list(leaf.devices())[0]
+          if leaf_device.platform not in platform:
+            errors.append((
+                f"Tree leaf '{_ai.format_tree_path(path)}' resides on "
+                f"'{leaf_device.platform}', expected '{platform}'."
+            ))
 
           # Check the device.
-          if device is not None and leaf.device() != device:
-            errors.append(
-                (f"Tree leaf '{_ai.format_tree_path(path)}' resides on "
-                 f"{leaf.device()}, expected {device}."))
+          if device is not None and leaf.devices() != {device}:
+            errors.append((
+                f"Tree leaf '{_ai.format_tree_path(path)}' resides on "
+                f"{leaf.devices()}, expected {device}."
+            ))
       else:
         errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' has "
                        f"unexpected type: {type(leaf)}."))
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
@@ -1088,21 +1218,19 @@ def assert_tree_is_on_device(tree: ArrayTree,
 @_static_assertion
 def assert_tree_is_sharded(tree: ArrayTree,
                            *,
-                           devices: Sequence[pytypes.Device],
-                           ignore_nones: bool = False) -> None:
+                           devices: Sequence[pytypes.Device]) -> None:
   """Checks that all leaves are ndarrays sharded across the specified devices.
 
   Args:
     tree: A tree to assert.
     devices: A list of devices which the tree's leaves are expected to be
       sharded across. This list is order-sensitive.
-    ignore_nones: Whether to ignore `None` in the tree.
 
   Raises:
     AssertionError: If the tree contains a leaf that is not a device array
       sharded across the specified devices.
   """
-  assert_tree_has_only_ndarrays(tree, ignore_nones=ignore_nones)
+  assert_tree_has_only_ndarrays(tree)
 
   errors = []
   devices = tuple(devices)
@@ -1112,39 +1240,45 @@ def assert_tree_is_sharded(tree: ArrayTree,
       nonlocal errors
 
       # Check that the leaf is a ShardedArray.
-      if isinstance(leaf, jax.Array) and _check_sharding(leaf):
-        shards = tuple(buf.device() for buf in leaf.device_buffers)
-        if shards != devices:
-          errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' is sharded "
-                         f"across {shards} devices, expected {devices}."))
+      if isinstance(leaf, jax.Array):
+        if _check_sharding(leaf):
+          shards = tuple(shard.device for shard in leaf.addressable_shards)
+          if shards != devices:
+            errors.append(
+                f"Tree leaf '{_ai.format_tree_path(path)}' is sharded "
+                f"across {shards} devices, expected {devices}."
+            )
+        else:
+          errors.append(
+              f"Tree leaf '{_ai.format_tree_path(path)}' is not sharded"
+              f" (devices={leaf.devices()})."
+          )
       else:
-        errors.append((f"Tree leaf '{_ai.format_tree_path(path)}' is not a "
-                       f"ShardedDeviceArray (type={type(leaf)})."))
+        errors.append(
+            f"Tree leaf '{_ai.format_tree_path(path)}' is not a "
+            f"jax.Array (type={type(leaf)})."
+        )
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
 
 @_static_assertion
 def assert_tree_shape_prefix(tree: ArrayTree,
-                             shape_prefix: Sequence[int],
-                             *,
-                             ignore_nones: bool = False) -> None:
+                             shape_prefix: Sequence[int]) -> None:
   """Checks that all ``tree`` leaves' shapes have the same prefix.
 
   Args:
     tree: A tree to check.
     shape_prefix: An expected shape prefix.
-    ignore_nones: Whether to ignore `None` in the tree.
 
   Raises:
-    AssertionError: If some leaf's shape doesn't start with ``shape_prefix``;
-      if ``ignore_nones`` isn't set and the tree contains `None`.
+    AssertionError: If some leaf's shape doesn't start with ``shape_prefix``.
   """
-  if not ignore_nones:
-    assert_tree_no_nones(tree)
+  # To compare with the leaf's `shape`, convert int sequence to tuple.
+  shape_prefix = tuple(shape_prefix)
 
   if not shape_prefix:
     return  # No prefix, this is trivially true.
@@ -1152,9 +1286,6 @@ def assert_tree_shape_prefix(tree: ArrayTree,
   errors = []
 
   def _assert_fn(path, leaf):
-    if leaf is None:
-      return
-
     nonlocal errors
     if len(shape_prefix) > len(leaf.shape):
       errors.append(
@@ -1170,39 +1301,34 @@ def assert_tree_shape_prefix(tree: ArrayTree,
           (f"Tree leaf '{_ai.format_tree_path(path)}' has a shape prefix "
            f"different from expected: {suffix} != {shape_prefix}."))
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
 
 @_static_assertion
-def assert_tree_shape_suffix(tree: ArrayTree,
-                             shape_suffix: Sequence[int],
-                             *,
-                             ignore_nones: bool = False) -> None:
+def assert_tree_shape_suffix(
+    tree: ArrayTree, shape_suffix: Sequence[int]
+) -> None:
   """Checks that all ``tree`` leaves' shapes have the same suffix.
 
   Args:
     tree: A tree to check.
     shape_suffix: An expected shape suffix.
-    ignore_nones: Whether to ignore `None` in the tree.
 
   Raises:
-    AssertionError: If some leaf's shape doesn't start with ``shape_suffix``;
-      if ``ignore_nones`` isn't set and the tree contains `None`.
+    AssertionError: If some leaf's shape doesn't end with ``shape_suffix``.
   """
-  if not ignore_nones:
-    assert_tree_no_nones(tree)
+  # To compare with the leaf's `shape`, convert int sequence to tuple.
+  shape_suffix = tuple(shape_suffix)
+
   if not shape_suffix:
     return  # No suffix, this is trivially true.
 
   errors = []
 
   def _assert_fn(path, leaf):
-    if leaf is None:
-      return
-
     nonlocal errors
     if len(shape_suffix) > len(leaf.shape):
       errors.append(
@@ -1218,8 +1344,8 @@ def assert_tree_shape_suffix(tree: ArrayTree,
           (f"Tree leaf '{_ai.format_tree_path(path)}' has a shape suffix "
            f"different from expected: {suffix} != {shape_suffix}."))
 
-  for path, leaf in dm_tree.flatten_with_path(tree):
-    _assert_fn(path, leaf)
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    _assert_fn(_ai.convert_jax_path_to_dm_path(path), leaf)
   if errors:
     raise AssertionError("\n".join(errors))
 
@@ -1227,8 +1353,6 @@ def assert_tree_shape_suffix(tree: ArrayTree,
 @_static_assertion
 def assert_trees_all_equal_structs(*trees: ArrayTree) -> None:
   """Checks that trees have the same structure.
-
-  Note that `None` is treated as a PyTree node.
 
   Args:
     *trees: A sequence of (at least 2) trees to assert equal structure between.
@@ -1253,17 +1377,10 @@ def assert_trees_all_equal_structs(*trees: ArrayTree) -> None:
           f"\n tree {i}: {treedef}")
 
 
-assert_tree_all_equal_structs = _ai.deprecation_wrapper(
-    assert_trees_all_equal_structs,
-    old_name="assert_tree_all_equal_structs",
-    new_name="assert_trees_all_equal_structs")
-
-
 @_static_assertion
 def assert_trees_all_equal_comparator(equality_comparator: _ai.TLeavesEqCmpFn,
                                       error_msg_fn: _ai.TLeavesEqCmpErrorFn,
-                                      *trees: ArrayTree,
-                                      ignore_nones: bool = False) -> None:
+                                      *trees: ArrayTree) -> None:
   """Checks that all trees are equal as per the custom comparator for leaves.
 
   Args:
@@ -1273,7 +1390,6 @@ def assert_trees_all_equal_comparator(equality_comparator: _ai.TLeavesEqCmpFn,
       ``equality_comparator`` leaves and returning an error message.
     *trees: A sequence of (at least 2) trees to check on equality as per
       ``equality_comparator``.
-    ignore_nones: Whether to ignore `None` in the trees.
 
   Raises:
     ValueError: If ``trees`` does not contain at least 2 elements.
@@ -1286,8 +1402,6 @@ def assert_trees_all_equal_comparator(equality_comparator: _ai.TLeavesEqCmpFn,
         "`assert_trees_xxx([a, b])` instead of `assert_trees_xxx(a, b)`, or "
         "forgot the `error_msg_fn` arg to `assert_trees_all_equal_comparator`?")
   assert_trees_all_equal_structs(*trees)
-  if not ignore_nones:
-    assert_tree_no_nones(trees)
 
   def tree_error_msg_fn(l_1: _ai.TLeaf, l_2: _ai.TLeaf, path: str, i_1: int,
                         i_2: int):
@@ -1297,47 +1411,28 @@ def assert_trees_all_equal_comparator(equality_comparator: _ai.TLeavesEqCmpFn,
     else:
       return f"Trees (arrays) {i_1} and {i_2} differ: {msg}."
 
-  def wrapped_equality_comparator(leaf_1, leaf_2):
-    if leaf_1 is None or leaf_1 is None:
-      # Either both or none of leaves can be `None`.
-      assert leaf_1 is None and leaf_2 is None, (
-          "non-mutual cases must be caught by assert_trees_all_equal_structs")
-      if ignore_nones:
-        return True
-
-    return equality_comparator(leaf_1, leaf_2)
-
   cmp_fn = functools.partial(_ai.assert_leaves_all_eq_comparator,
-                             wrapped_equality_comparator, tree_error_msg_fn)
+                             equality_comparator, tree_error_msg_fn)
 
   # Trees are guaranteed to have the same structure.
-  paths = [path for path, _ in dm_tree.flatten_with_path(trees[0])]
-  trees_leaves = [dm_tree.flatten(tree) for tree in trees]
+  paths = [
+      _ai.convert_jax_path_to_dm_path(path)
+      for path, _ in jax.tree_util.tree_flatten_with_path(trees[0])[0]]
+  trees_leaves = [jax.tree_util.tree_leaves(tree) for tree in trees]
   for leaf_i, path in enumerate(paths):
     cmp_fn(path, *[leaves[leaf_i] for leaves in trees_leaves])
 
 
-assert_tree_all_equal_comparator = _ai.deprecation_wrapper(
-    assert_trees_all_equal_comparator,
-    old_name="assert_tree_all_equal_comparator",
-    new_name="assert_trees_all_equal_comparator")
-
-
 @_static_assertion
-def assert_trees_all_equal_dtypes(*trees: ArrayTree,
-                                  ignore_nones: bool = False) -> None:
+def assert_trees_all_equal_dtypes(*trees: ArrayTree) -> None:
   """Checks that trees' leaves have the same dtype.
-
-  Note that `None` is treated as a PyTree nodes.
 
   Args:
     *trees: A sequence of (at least 2) trees to check.
-    ignore_nones: Whether to ignore `None` in the trees.
 
   Raises:
     AssertionError: If leaves' dtypes for any two trees differ.
   """
-
   def cmp_fn(arr_1, arr_2):
     return (hasattr(arr_1, "dtype") and hasattr(arr_2, "dtype") and
             arr_1.dtype == arr_2.dtype)
@@ -1349,33 +1444,52 @@ def assert_trees_all_equal_dtypes(*trees: ArrayTree,
       return f"{type(arr_2)} is not a (j-)np array (has no `dtype` property)"
     return f"types: {arr_1.dtype} != {arr_2.dtype}"
 
-  assert_trees_all_equal_comparator(
-      cmp_fn, err_msg_fn, *trees, ignore_nones=ignore_nones)
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
 
 
 @_static_assertion
-def assert_trees_all_equal_shapes(*trees: ArrayTree,
-                                  ignore_nones: bool = False) -> None:
+def assert_trees_all_equal_sizes(*trees: ArrayTree) -> None:
+  """Checks that trees have the same structure and leaves' sizes.
+
+  Args:
+    *trees: A sequence of (at least 2) trees with array leaves.
+
+  Raises:
+    AssertionError: If trees' structures or leaves' sizes are different.
+  """
+  cmp_fn = lambda arr_1, arr_2: arr_1.size == arr_2.size
+  err_msg_fn = lambda arr_1, arr_2: f"sizes: {arr_1.size} != {arr_2.size}"
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
+
+
+@_static_assertion
+def assert_trees_all_equal_shapes(*trees: ArrayTree) -> None:
   """Checks that trees have the same structure and leaves' shapes.
 
   Args:
     *trees: A sequence of (at least 2) trees with array leaves.
-    ignore_nones: Whether to ignore `None` in the trees.
 
   Raises:
-    AssertionError: If trees' structures or leaves' shapes are different;
-      if the trees contain `None` (with ``ignore_nones=False``).
+    AssertionError: If trees' structures or leaves' shapes are different.
   """
   cmp_fn = lambda arr_1, arr_2: arr_1.shape == arr_2.shape
   err_msg_fn = lambda arr_1, arr_2: f"shapes: {arr_1.shape} != {arr_2.shape}"
-  assert_trees_all_equal_comparator(
-      cmp_fn, err_msg_fn, *trees, ignore_nones=ignore_nones)
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
 
 
-assert_tree_all_equal_shapes = _ai.deprecation_wrapper(
-    assert_trees_all_equal_shapes,
-    old_name="assert_tree_all_equal_shapes",
-    new_name="assert_trees_all_equal_shapes")
+@_static_assertion
+def assert_trees_all_equal_shapes_and_dtypes(*trees: ArrayTree) -> None:
+  """Checks that trees' leaves have the same shape and dtype.
+
+  Args:
+    *trees: A sequence of (at least 2) trees to check.
+
+  Raises:
+    AssertionError: If leaves' shapes or dtypes for any two trees differ.
+  """
+  assert_trees_all_equal_shapes(*trees)
+  assert_trees_all_equal_dtypes(*trees)
+
 
 ############# Value assertions. #############
 
@@ -1393,16 +1507,24 @@ def _assert_tree_all_finite_static(tree_like: ArrayTree) -> None:
       jax.tree_util.tree_map(lambda x: np.all(np.isfinite(x)), tree_like))
   if not all_finite:
     is_finite = lambda x: "Finite" if np.all(np.isfinite(x)) else "Nonfinite"
-    error_msg = jax.tree_map(is_finite, tree_like)
+    error_msg = jax.tree.map(is_finite, tree_like)
     raise AssertionError(f"Tree contains non-finite value: {error_msg}.")
 
 
 def _assert_tree_all_finite_jittable(tree_like: ArrayTree) -> Array:
   """A jittable version of `_assert_tree_all_finite_static`."""
-  return jnp.all(
-      jnp.asarray([
-          jnp.isfinite(x).all() for x in jax.tree_util.tree_leaves(tree_like)
-      ]))
+  labeled_tree = jax.tree.map(
+      lambda x: jax.lax.select(jnp.isfinite(x).all(), .0, jnp.nan), tree_like
+  )
+  predicate = jnp.all(
+      jnp.isfinite(jnp.asarray(jax.tree_util.tree_leaves(labeled_tree)))
+  )
+  checkify.check(
+      pred=predicate,
+      msg="Tree contains non-finite value: {tree}.",
+      tree=labeled_tree,
+  )
+  return predicate
 
 
 assert_tree_all_finite = _value_assertion(
@@ -1412,8 +1534,9 @@ assert_tree_all_finite = _value_assertion(
 
 
 @_static_assertion
-def _assert_trees_all_equal_static(*trees: ArrayTree,
-                                   ignore_nones: bool = False) -> None:
+def _assert_trees_all_equal_static(
+    *trees: ArrayTree, strict: bool = False
+) -> None:
   """Checks that all trees have leaves with *exactly* equal values.
 
   If you are comparing floating point numbers, an exact equality check may not
@@ -1421,18 +1544,27 @@ def _assert_trees_all_equal_static(*trees: ArrayTree,
 
   Args:
     *trees: A sequence of (at least 2) trees with array leaves.
-    ignore_nones: Whether to ignore `None` in the trees.
+    strict: If True, disable special scalar handling as described in
+      `np.testing.assert_array_equals` notes section.
 
   Raises:
-    AssertionError: If the leaf values actual and desired are not exactly equal,
-      or the trees contain `None` (with ``ignore_nones=False``).
+    AssertionError: If the leaf values actual and desired are not exactly equal.
   """
-
   def assert_fn(arr_1, arr_2):
+    if isinstance(arr_1, jax.Array) and jax.dtypes.issubdtype(
+        arr_1.dtype, jax.dtypes.prng_key
+    ) and isinstance(arr_2, jax.Array) and jax.dtypes.issubdtype(
+        arr_2.dtype, jax.dtypes.prng_key
+    ):
+      assert jax.random.key_impl(arr_1) == jax.random.key_impl(arr_2)
+      arr_1 = jax.random.key_data(arr_1)
+      arr_2 = jax.random.key_data(arr_2)
     np.testing.assert_array_equal(
         _ai.jnp_to_np_array(arr_1),
         _ai.jnp_to_np_array(arr_2),
-        err_msg="Error in value equality check: Values not exactly equal")
+        err_msg="Error in value equality check: Values not exactly equal",
+        strict=strict,
+    )
 
   def cmp_fn(arr_1, arr_2) -> bool:
     try:
@@ -1446,34 +1578,52 @@ def _assert_trees_all_equal_static(*trees: ArrayTree,
     try:
       assert_fn(arr_1, arr_2)
     except AssertionError as e:
-      return (f"{str(e)} \nOriginal dtypes: "
-              f"{np.asarray(arr_1).dtype}, {np.asarray(arr_2).dtype}")
+      dtype_1 = (
+          arr_1.dtype
+          if isinstance(arr_1, jax.Array)
+          else np.asarray(arr_1).dtype
+      )
+      dtype_2 = (
+          arr_2.dtype
+          if isinstance(arr_2, jax.Array)
+          else np.asarray(arr_1).dtype
+      )
+      return f"{str(e)} \nOriginal dtypes: {dtype_1}, {dtype_2}"
     return ""
 
-  assert_trees_all_equal_comparator(
-      cmp_fn, err_msg_fn, *trees, ignore_nones=ignore_nones)
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
 
 
-def _assert_trees_all_equal_jittable(*trees: ArrayTree,
-                                     ignore_nones: bool = False) -> Array:
+def _assert_trees_all_equal_jittable(
+    *trees: ArrayTree, strict: bool = True,
+) -> Array:
   """A jittable version of `_assert_trees_all_equal_static`."""
-  if not ignore_nones:
-    assert_tree_no_nones(trees)
+  if not strict:
+    raise NotImplementedError(
+        "`strict=False` is not implemented by"
+        " `_assert_trees_all_equal_jittable`. This is a feature of"
+        " `np.testing.assert_array_equal` used in the static implementation of"
+        " `assert_trees_all_equal` that we do not implement in the jittable"
+        " version."
+    )
 
+  err_msg_template = "Values not exactly equal: {arr_1} != {arr_2}."
   cmp_fn = lambda x, y: jnp.array_equal(x, y, equal_nan=True)
-  return _ai.assert_trees_all_eq_comparator_jittable(cmp_fn, *trees)
+  return _ai.assert_trees_all_eq_comparator_jittable(
+      cmp_fn, err_msg_template, *trees
+  )
 
 
 assert_trees_all_equal = _value_assertion(
     assert_fn=_assert_trees_all_equal_static,
     jittable_assert_fn=_assert_trees_all_equal_jittable,
-    name="assert_trees_all_equal")
+    name="assert_trees_all_equal",
+)
 
 
 def _assert_trees_all_close_static(*trees: ArrayTree,
                                    rtol: float = 1e-06,
-                                   atol: float = .0,
-                                   ignore_nones: bool = False) -> None:
+                                   atol: float = .0) -> None:
   """Checks that all trees have leaves with approximately equal values.
 
   This compares the difference between values of actual and desired up to
@@ -1483,14 +1633,11 @@ def _assert_trees_all_close_static(*trees: ArrayTree,
     *trees: A sequence of (at least 2) trees with array leaves.
     rtol: A relative tolerance.
     atol: An absolute tolerance.
-    ignore_nones: Whether to ignore `None` in the trees.
 
   Raises:
     AssertionError: If actual and desired values are not equal up to
-      specified tolerance; if the trees contain `None` (with
-      ``ignore_nones=False``).
+      specified tolerance.
   """
-
   def assert_fn(arr_1, arr_2):
     np.testing.assert_allclose(
         _ai.jnp_to_np_array(arr_1),
@@ -1515,20 +1662,21 @@ def _assert_trees_all_close_static(*trees: ArrayTree,
               f"{np.asarray(arr_1).dtype}, {np.asarray(arr_2).dtype}")
     return ""
 
-  assert_trees_all_equal_comparator(
-      cmp_fn, err_msg_fn, *trees, ignore_nones=ignore_nones)
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
 
 
 def _assert_trees_all_close_jittable(*trees: ArrayTree,
                                      rtol: float = 1e-06,
-                                     atol: float = .0,
-                                     ignore_nones: bool = False) -> Array:
+                                     atol: float = .0) -> Array:
   """A jittable version of `_assert_trees_all_close_static`."""
-  if not ignore_nones:
-    assert_tree_no_nones(trees)
-
+  err_msg_template = (
+      f"Values not approximately equal ({rtol=}, {atol=}): "
+      + "{arr_1} != {arr_2}."
+  )
   cmp_fn = lambda x, y: jnp.isclose(x, y, rtol=rtol, atol=atol).all()
-  return _ai.assert_trees_all_eq_comparator_jittable(cmp_fn, *trees)
+  return _ai.assert_trees_all_eq_comparator_jittable(
+      cmp_fn, err_msg_template, *trees
+  )
 
 
 assert_trees_all_close = _value_assertion(
@@ -1536,7 +1684,123 @@ assert_trees_all_close = _value_assertion(
     jittable_assert_fn=_assert_trees_all_close_jittable,
     name="assert_trees_all_close")
 
-assert_tree_all_close = _ai.deprecation_wrapper(
-    assert_trees_all_close,
-    old_name="assert_tree_all_close",
-    new_name="assert_trees_all_close")
+
+def _assert_trees_all_close_ulp_static(
+    *trees: ArrayTree,
+    maxulp: int = 1,
+) -> None:
+  """Checks that tree leaves differ by at most `maxulp` Units in the Last Place.
+
+  This is the Chex version of np.testing.assert_array_max_ulp.
+
+  Assertions on floating point values are tricky because the precision varies
+  depending on the value. For example, with float32, the precision at 1 is
+  np.spacing(np.float32(1.0)) ≈ 1e-7, but the precision at 5,000,000 is only
+  np.spacing(np.float32(5e6)) = 0.5. This makes it hard to predict ahead of time
+  what tolerance to use when checking whether two numbers are equal: a
+  difference of only a couple of bits can equate to an arbitrarily large
+  absolute difference.
+
+  Assertions based on _relative_ differences are one solution to this problem,
+  but have the disadvantage that it's hard to choose the tolerance. If you want
+  to verify that two calculations produce _exactly_ the same result
+  modulo the inherent non-determinism of floating point operations, do you set
+  the tolerance to...0.01? 0.001? It's hard to be sure you've set it low enough
+  that you won't miss one of your computations being slightly wrong.
+
+  Assertions based on 'units in the last place' (ULP) instead solve this
+  problem by letting you specify tolerances in terms of the precision actually
+  available at the current scale of your values. The ULP at some value x is
+  essentially the spacing between the floating point numbers actually
+  representable in the vicinity of x - equivalent to the 'precision' we
+  discussed above. above. With a tolerance of, say, `maxulp=5`, you're saying
+  that two values are within 5 actually-representable-numbers of each other -
+  a strong guarantee that two computations are as close as possible to
+  identical, while still allowing reasonable wiggle room for small differences
+  due to e.g. different operator orderings.
+
+  Note that this function is not currently supported within JIT contexts,
+  and does not currently support bfloat16 dtypes.
+
+  Args:
+    *trees: A sequence of (at least 2) trees with array leaves.
+    maxulp: The maximum number of ULPs by which leaves may differ.
+
+  Raises:
+    AssertionError: If actual and desired values are not equal up to
+      specified tolerance.
+  """
+  def assert_fn(arr_1, arr_2):
+    if (
+        getattr(arr_1, "dtype", None) == jnp.bfloat16
+        or getattr(arr_2, "dtype", None) == jnp.bfloat16
+    ):
+      # jnp_to_np_array currently converts bfloat16 to float32, which will cause
+      # assert_array_max_ulp to give incorrect results -
+      # and assert_array_max_ulp itself does not currently support bfloat16:
+      # https://github.com/jax-ml/ml_dtypes/issues/56
+      raise ValueError(
+          f"{_ai.ERR_PREFIX}ULP assertions are not currently supported for "
+          "bfloat16."
+      )
+    np.testing.assert_array_max_ulp(
+        _ai.jnp_to_np_array(arr_1),
+        _ai.jnp_to_np_array(arr_2),
+        maxulp=maxulp,
+    )
+
+  def cmp_fn(arr_1, arr_2) -> bool:
+    try:
+      # Raises an AssertionError if values are not close.
+      assert_fn(arr_1, arr_2)
+    except AssertionError:
+      return False
+    return True
+
+  def err_msg_fn(arr_1, arr_2) -> str:
+    try:
+      assert_fn(arr_1, arr_2)
+    except AssertionError as e:
+      return (
+          f"{str(e)} \nOriginal dtypes: "
+          f"{np.asarray(arr_1).dtype}, {np.asarray(arr_2).dtype}"
+      )
+    return ""
+
+  assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
+
+
+# The return should be typing.NoReturn, but that would significantly complicate
+# the signature of _value_assertion, so we pretend the return is jax.Array.
+def _assert_trees_all_close_ulp_jittable(
+    *trees: ArrayTree,
+    maxulp: int = 1,
+) -> jax.Array:
+  """A dummy jittable version of `_assert_trees_all_close_ulp_static`.
+
+  JAX does not yet have a native version of assert_array_max_ulp, so at the
+  moment making ULP assertions on tracer objects simply isn't supported.
+  This function exists only to make sure a sensible error is given.
+
+  Args:
+    *trees: Ignored.
+    maxulp: Ignored.
+
+  Raises:
+    NotImplementedError: unconditionally.
+
+  Returns:
+    Never returns. (We pretend jax.Array to satisfy the type checker.)
+  """
+  del trees, maxulp
+  raise NotImplementedError(
+      f"{_ai.ERR_PREFIX}assert_trees_all_close_ulp is not supported within JIT "
+      "contexts."
+  )
+
+
+assert_trees_all_close_ulp = _value_assertion(
+    assert_fn=_assert_trees_all_close_ulp_static,
+    jittable_assert_fn=_assert_trees_all_close_ulp_jittable,
+    name="assert_trees_all_close_ulp",
+)

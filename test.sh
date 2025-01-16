@@ -17,16 +17,31 @@
 set -xeuo pipefail
 
 # Install deps in a virtual env.
-readonly VENV_DIR=/tmp/chex-env
-rm -rf "${VENV_DIR}"
+rm -rf _testing
+rm -rf .pytype
+mkdir -p _testing
+readonly VENV_DIR="$(mktemp -d -p `pwd`/_testing chex-env.XXXXXXXX)"
+# in the unlikely case in which there was something in that directory
 python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 python --version
 
 # Install dependencies.
 pip install --upgrade pip setuptools wheel
-pip install flake8 pytest-xdist pytype pylint pylint-exit
+pip install flake8 pytest-xdist pylint pylint-exit
 pip install -r requirements/requirements.txt
+pip install -r requirements/requirements-test.txt
+
+# Install the requested JAX version
+if [ "$JAX_VERSION" = "" ]; then
+  : # use version installed in requirements above
+elif [ "$JAX_VERSION" = "newest" ]; then
+  pip install -U jax jaxlib
+elif [ "$JAX_VERSION" = "nightly" ]; then
+  pip install -U --pre jax jaxlib -f https://storage.googleapis.com/jax-releases/jax_nightly_releases.html
+else
+  pip install "jax==${JAX_VERSION}" "jaxlib==${JAX_VERSION}"
+fi
 
 # Lint with flake8.
 flake8 `find chex -name '*.py' | xargs` --count --select=E9,F63,F7,F82,E225,E251 --show-source --statistics
@@ -37,11 +52,11 @@ PYLINT_ARGS="-efail -wfail -cfail -rfail"
 wget -nd -v -t 3 -O .pylintrc https://google.github.io/styleguide/pylintrc
 # Append specific config lines.
 echo "signature-mutators=toolz.functoolz.curry" >> .pylintrc
-echo "disable=unnecessary-lambda-assignment" >> .pylintrc
+echo "disable=unnecessary-lambda-assignment,use-dict-literal" >> .pylintrc
 # Lint modules and tests separately.
-pylint --rcfile=.pylintrc `find chex -name '*.py' | grep -v 'test.py' | xargs` || pylint-exit $PYLINT_ARGS $?
+pylint --rcfile=.pylintrc `find chex -name '*.py' | grep -v 'test.py' | xargs` -d E1102|| pylint-exit $PYLINT_ARGS $?
 # Disable `protected-access` warnings for tests.
-pylint --rcfile=.pylintrc `find chex -name '*_test.py' | xargs` -d W0212 || pylint-exit $PYLINT_ARGS $?
+pylint --rcfile=.pylintrc `find chex -name '*_test.py' | xargs` -d W0212,E1130,E1102 || pylint-exit $PYLINT_ARGS $?
 # Cleanup.
 rm .pylintrc
 
@@ -51,12 +66,18 @@ pip wheel --verbose --no-deps --no-clean dist/chex*.tar.gz
 pip install chex*.whl
 
 # Check types with pytype.
-pytype `find chex/_src/ -name "*py" | xargs` -k
+# Note: pytype does not support 3.11 as of 25.06.23
+# See https://github.com/google/pytype/issues/1308
+if [ `python -c 'import sys; print(sys.version_info.minor)'` -lt 11 ];
+then
+  pip install pytype
+  pytype `find chex/_src -name "*py" | xargs` -k
+fi;
 
 # Run tests using pytest.
 # Change directory to avoid importing the package from repo root.
 pip install -r requirements/requirements-test.txt
-mkdir _testing && cd _testing
+cd _testing
 
 # Main tests.
 pytest -n "$(grep -c ^processor /proc/cpuinfo)" --pyargs chex -k "not fake_set_n_cpu_devices_test"
@@ -66,11 +87,15 @@ pytest -n "$(grep -c ^processor /proc/cpuinfo)" --pyargs chex -k "fake_set_n_cpu
 cd ..
 
 # Build Sphinx docs.
+
 pip install -r requirements/requirements-docs.txt
 cd docs
 make coverage_check
 make html
 cd ..
+
+# cleanup
+rm -rf _testing
 
 set +u
 deactivate

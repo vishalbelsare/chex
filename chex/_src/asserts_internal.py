@@ -24,11 +24,12 @@ Instead, consider opening an issue on GitHub and describing your use case.
 
 import collections
 import collections.abc
+from collections.abc import Hashable
 import functools
 import re
 import threading
 import traceback
-from typing import Any, Sequence, Union, Callable, Optional, Set, Tuple, Type
+from typing import Any, Sequence, Union, Callable, List, Optional, Set, Tuple, Type
 
 from absl import logging
 from chex._src import pytypes
@@ -52,11 +53,18 @@ TLeavesEqCmpErrorFn = Callable[[TLeaf, TLeaf], str]
 #  **kwargs)
 TChexAssertion = Callable[..., None]
 TAssertFn = Callable[..., None]
-TJittableAssertFn = Callable[..., bool]  # a predicate function
+TJittableAssertFn = Callable[..., pytypes.Array]  # a predicate function
 
 # Matchers.
 TDimMatcher = Optional[Union[int, Set[int], type(Ellipsis)]]
 TShapeMatcher = Sequence[TDimMatcher]
+
+
+class _ChexifyStorage(threading.local):
+  """Thread-safe storage for internal variables used in @chexify."""
+  wait_fns = []
+  level = 0
+
 
 # Chex namespace variables.
 ERR_PREFIX = "[Chex] "
@@ -64,9 +72,7 @@ TRACE_COUNTER = collections.Counter()
 DISABLE_ASSERTIONS = False
 
 # This variable is used for _chexify_ transformations, see `asserts_chexify.py`.
-CHEXIFY_STORAGE = threading.local()
-CHEXIFY_STORAGE.wait_fns = []
-CHEXIFY_STORAGE.level = 0
+CHEXIFY_STORAGE = _ChexifyStorage()
 
 
 def assert_collection_of_arrays(inputs: Sequence[pytypes.Array]):
@@ -75,16 +81,12 @@ def assert_collection_of_arrays(inputs: Sequence[pytypes.Array]):
     raise ValueError(f"`inputs` is not a collection of arrays: {inputs}.")
 
 
-def jnp_to_np_array(arr: pytypes.Array) -> pytypes.Array:
+def jnp_to_np_array(arr: pytypes.Array) -> np.ndarray:
   """Converts `jnp.ndarray` to `np.ndarray`."""
-  if isinstance(arr, jnp.ndarray):
-    if arr.dtype == jnp.bfloat16:
-      # Numpy does not support `bfloat16`.
-      return np.asarray(arr, np.float32)
-    else:
-      return np.asarray(arr, arr.dtype)
-  else:
-    return arr
+  if getattr(arr, "dtype", None) == jnp.bfloat16:
+    # Numpy does not support `bfloat16`.
+    arr = arr.astype(jnp.float32)
+  return jax.device_get(arr)
 
 
 def deprecation_wrapper(new_fn, old_name, new_name):
@@ -99,16 +101,17 @@ def deprecation_wrapper(new_fn, old_name, new_name):
   return inner_fn
 
 
-def get_last_non_chex_frame() -> traceback.FrameSummary:
+def get_stacktrace_without_chex_internals() -> List[traceback.FrameSummary]:
   """Returns the latest non-chex frame from the call stack."""
-  for frame in reversed(traceback.extract_stack()):
-    if not frame.filename.count("/chex/") or frame.filename.endswith(
-        "_test.py"):
-      return frame
+  stacktrace = list(traceback.extract_stack())
+  for i in reversed(range(len(stacktrace))):
+    fname = stacktrace[i].filename
+    if fname.find("/chex/") == -1 or fname.endswith("_test.py"):
+      return stacktrace[:i+1]
 
   debug_info = "\n-----\n".join(traceback.format_stack())
   raise RuntimeError(
-      "get_last_non_chex_frame() failed. "
+      "get_stacktrace_without_chex_internals() failed. "
       "Please file a bug at https://github.com/deepmind/chex/issues and "
       "include the following debug info in it. "
       "Please make sure it does not include any private information! "
@@ -128,10 +131,9 @@ def get_err_regex(message: str) -> str:
   return f"{re.escape(ERR_PREFIX)}[\\s\\S]*{message}"
 
 
-def get_chexify_err_message(name: str, custom_msg: Optional[str] = None) -> str:
+def get_chexify_err_message(name: str, msg: str = "") -> str:
   """Constructs an error message for the chexify exception."""
-  custom_msg = f" [{custom_msg}]" if custom_msg else ""
-  return f"{ERR_PREFIX}chexify assertion '{name}' failed{custom_msg}"
+  return f"{ERR_PREFIX}chexify assertion '{name}' failed: {msg}"
 
 
 def _make_host_assertion(assert_fn: TAssertFn,
@@ -227,21 +229,60 @@ def chex_assertion(
   host_assertion_fn = _make_host_assertion(assert_fn, name)
 
   @functools.wraps(assert_fn)
-  def _chex_assert_fn(*args, **kwargs) -> None:
+  def _chex_assert_fn(*args,
+                      custom_message: Optional[str] = None,
+                      custom_message_format_vars: Sequence[Any] = (),
+                      include_default_message: bool = True,
+                      exception_type: Type[Exception] = AssertionError,
+                      **kwargs) -> None:
     if DISABLE_ASSERTIONS:
       return
-    if jittable_assert_fn is not None and has_tracers((args, kwargs)):
+    if (jittable_assert_fn is not None and has_tracers((args, kwargs))):
       if not CHEXIFY_STORAGE.level:
         raise RuntimeError(
             "Value assertions can only be called from functions wrapped "
             "with `@chex.chexify`. See the docs.")
-      msg = get_chexify_err_message(name, kwargs.pop("custom_message", None))
-      callsite_frame = get_last_non_chex_frame()
-      msg += f" [failed at {callsite_frame.filename}:{callsite_frame.lineno}]"
-      checkify.check(pred=jittable_assert_fn(*args, **kwargs), msg=msg)
+
+      # A wrapped to inject auxiliary debug info and `custom_message`.
+      original_check = checkify.check
+
+      def _check(pred, msg, *fmt_args, **fmt_kwargs):
+        # Add chex info.
+        msg = get_chexify_err_message(name, msg)
+
+        # Add a custom message.
+        if custom_message:
+          msg += f" Custom message: {custom_message}."
+          fmt_args = list(fmt_args) + list(custom_message_format_vars)
+
+        # Add a traceback and a pointer to the callsite.
+        stacktrace = get_stacktrace_without_chex_internals()
+        msg += (
+            f" [failed at: {stacktrace[-1].filename}:{stacktrace[-1].lineno}]"
+        )
+
+        # Call original `checkify.check()`.
+        original_check(pred, msg, *fmt_args, **fmt_kwargs)
+
+      # Mock during the assertion's execution time.
+      checkify.check = _check
+      pred = jittable_assert_fn(*args, **kwargs)  # execute the assertion
+      checkify.check = original_check  # return the original implementation
+
+      # A safeguard to ensure that the results of a check are not ignored.
+      # In particular, this check fails when `pred` is False and no
+      # `checkify.check` calls took place in `jittable_assert_fn`, which would
+      # be a bug in the assertion's implementation.
+      checkify.check(pred, "assertion failed!")
     else:
       try:
-        host_assertion_fn(*args, **kwargs)
+        host_assertion_fn(
+            *args,
+            custom_message=custom_message,
+            custom_message_format_vars=custom_message_format_vars,
+            include_default_message=include_default_message,
+            exception_type=exception_type,
+            **kwargs)
       except jax.errors.ConcretizationTypeError as exc:
         msg = ("Chex assertion detected `ConcretizationTypeError`: it is very "
                "likely that it tried to access tensors' values during tracing. "
@@ -259,7 +300,7 @@ def format_tree_path(path: Sequence[Any]) -> str:
 
 
 def format_shape_matcher(shape: TShapeMatcher) -> str:
-  return f"({', '.join('...' if d is Ellipsis else str(d) for d in shape)})"
+  return f"({', '.join('...' if d is Ellipsis else str(d) for d in shape)})"  # pylint: disable=inconsistent-quotes
 
 
 def num_devices_available(devtype: str, backend: Optional[str] = None) -> int:
@@ -301,18 +342,18 @@ def is_traceable(fn) -> bool:
   """
 
   fn_string_tokens = (
-      "_python_jit.",  # PyJIT  in Python ver. < 3.7
-      "_cpp_jit.",  # CppJIT in Python ver. < 3.7 (deprecated)
       ".reraise_with_filtered_traceback",  # JIT    in Python ver. >= 3.7
       "CompiledFunction",  # C++ JIT in jaxlib 0.1.66 or newer.
       "pmap.",  # Python pmap
       "PmapFunction",  # C++ pmap in jaxlib 0.1.72 or newer.
       "vmap.",  # vmap
+      "_python_pjit",
+      "_cpp_pjit",
   )
 
   fn_type_tokens = (
-      "CompiledFunction",
       "PmapFunction",
+      "PjitFunction",
   )
 
   # Un-wrap `fn` and check if any internal fn is jitted by pattern matching.
@@ -337,7 +378,7 @@ def is_traceable(fn) -> bool:
         return True
 
       try:
-        if isinstance(fn_, jax.lib.xla_extension.jax_jit.CompiledFunction):
+        if isinstance(fn_, jax.lib.xla_extension.PjitFunction):
           return True
       except AttributeError:
         pass
@@ -361,6 +402,7 @@ def assert_leaves_all_eq_comparator(
 
 def assert_trees_all_eq_comparator_jittable(
     equality_comparator: TLeavesEqCmpFn,
+    error_msg_template: str,
     *trees: Sequence[pytypes.ArrayTree]) -> pytypes.Array:
   """Asserts all trees are equal using custom comparator. JIT-friendly."""
 
@@ -370,13 +412,73 @@ def assert_trees_all_eq_comparator_jittable(
         "`assert_trees_xxx([a, b])` instead of `assert_trees_xxx(a, b)`, or "
         "forgot the `error_msg_fn` arg to `assert_trees_xxx`?")
 
-  def _cmp_leaves(*leaves):
-    res = jnp.array(True)
-    for arr in leaves[1:]:
-      res = jnp.logical_and(res, equality_comparator(arr, leaves[0]))
-    return res
+  def _tree_error_msg_fn(
+      path: Tuple[Union[int, str, Hashable]], i_1: int, i_2: int):
+    if path:
+      return (
+          f"Trees {i_1} and {i_2} differ in leaves '{path}':"
+          f" {error_msg_template}"
+      )
+    else:
+      return f"Trees (arrays) {i_1} and {i_2} differ: {error_msg_template}."
 
-  result = jnp.array(True)
-  for res in jax.tree_util.tree_leaves(jax.tree_map(_cmp_leaves, *trees)):
-    result = jnp.logical_and(result, res)
-  return result
+  def _cmp_leaves(path, *leaves):
+    verdict = jnp.array(True)
+    for i in range(1, len(leaves)):
+      check_res = equality_comparator(leaves[0], leaves[i])
+      checkify.check(
+          pred=check_res,
+          msg=_tree_error_msg_fn(path, 0, i),
+          arr_1=leaves[0],
+          arr_2=leaves[i],
+      )
+      verdict = jnp.logical_and(verdict, check_res)
+    return verdict
+
+  # Trees are guaranteed to have the same structure.
+  paths = [
+      convert_jax_path_to_dm_path(path)
+      for path, _ in jax.tree_util.tree_flatten_with_path(trees[0])[0]]
+  trees_leaves = [jax.tree_util.tree_leaves(tree) for tree in trees]
+
+  verdict = jnp.array(True)
+  for leaf_i, path in enumerate(paths):
+    verdict = jnp.logical_and(
+        verdict, _cmp_leaves(path, *[leaves[leaf_i] for leaves in trees_leaves])
+    )
+
+  return verdict
+
+
+JaxKeyType = Union[
+    int,
+    str,
+    Hashable,
+    jax.tree_util.SequenceKey,
+    jax.tree_util.DictKey,
+    jax.tree_util.FlattenedIndexKey,
+    jax.tree_util.GetAttrKey,
+]
+
+
+def convert_jax_path_to_dm_path(
+    jax_tree_path: Sequence[JaxKeyType],
+) -> Tuple[Union[int, str, Hashable]]:
+  """Converts a path from jax.tree_util to one from dm-tree."""
+
+  # pytype:disable=attribute-error
+  def _convert_key_fn(key: JaxKeyType) -> Union[int, str, Hashable]:
+    if isinstance(key, (str, int)):
+      return key  # int | str.
+    if isinstance(key, jax.tree_util.SequenceKey):
+      return key.idx  # int.
+    if isinstance(key, jax.tree_util.DictKey):
+      return key.key  # Hashable
+    if isinstance(key, jax.tree_util.FlattenedIndexKey):
+      return key.key  # int.
+    if isinstance(key, jax.tree_util.GetAttrKey):
+      return key.name  # str.
+    raise ValueError(f"Jax tree key '{key}' of type '{type(key)}' not valid.")
+  # pytype:enable=attribute-error
+
+  return tuple(_convert_key_fn(key) for key in jax_tree_path)

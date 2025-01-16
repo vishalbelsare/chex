@@ -14,8 +14,10 @@
 # ==============================================================================
 """Utilities to hold expected dimension sizes."""
 
+from collections.abc import Sized
+import math
 import re
-from typing import Any, Collection, Dict, Optional, Sized, Tuple
+from typing import Any, Collection, Dict, Optional, Tuple
 
 
 Shape = Tuple[Optional[int], ...]
@@ -59,6 +61,20 @@ class Dimensions:
     >>> dims['XY'] = z.shape
     >>> dims
     Dimensions(B=3, N=7, T=5, X=2, Y=4)
+
+  You can access the flat size of a shape as
+
+  .. code::
+
+    >>> dims.size('BT')  # Same as prod(dims['BT']).
+    15
+
+  Similarly, you can flatten axes together by wrapping them in parentheses:
+
+  .. code::
+
+    >>> dims['(BT)N']
+    (15, 7)
 
   You can set a wildcard dimension, cf. :func:`chex.assert_shape`:
 
@@ -110,7 +126,6 @@ class Dimensions:
 
     >>> dims['M']
     (7,)
-
   """
   # Tell static type checker not to worry about attribute errors.
   _HAS_DYNAMIC_ATTRIBUTES = True
@@ -119,9 +134,50 @@ class Dimensions:
     for dim, size in dim_sizes.items():
       self._setdim(dim, size)
 
+  def size(self, key: str) -> int:
+    """Returns the flat size of a given named shape, i.e. prod(shape)."""
+    shape = self[key]
+    if any(size is None or size <= 0 for size in shape):
+      raise ValueError(
+          f"cannot take product of shape '{key}' = {shape}, "
+          'because it contains non-positive sized dimensions'
+      )
+    return math.prod(shape)
+
   def __getitem__(self, key: str) -> Shape:
     self._validate_key(key)
-    return tuple(self._getdim(dim) for dim in key)
+    shape = []
+    open_parentheses = False
+    dims_to_flatten = ''
+    for dim in key:
+      # Signal to start accumulating `dims_to_flatten`.
+      if dim == '(':
+        if open_parentheses:
+          raise ValueError(f"nested parentheses are unsupported; got: '{key}'")
+        open_parentheses = True
+
+      # Signal to collect accumulated `dims_to_flatten`.
+      elif dim == ')':
+        if not open_parentheses:
+          raise ValueError(f"unmatched parentheses in named shape: '{key}'")
+        if not dims_to_flatten:
+          raise ValueError(f"found empty parentheses in named shape: '{key}'")
+        shape.append(self.size(dims_to_flatten))
+        # Reset.
+        open_parentheses = False
+        dims_to_flatten = ''
+
+      # Accumulate `dims_to_flatten`.
+      elif open_parentheses:
+        dims_to_flatten += dim
+
+      # The typical (non-flattening) case.
+      else:
+        shape.append(self._getdim(dim))
+
+    if open_parentheses:
+      raise ValueError(f"unmatched parentheses in named shape: '{key}'")
+    return tuple(shape)
 
   def __setitem__(self, key: str, value: Collection[Optional[int]]) -> None:
     self._validate_key(key)

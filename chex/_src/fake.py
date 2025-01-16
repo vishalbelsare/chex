@@ -69,7 +69,7 @@ def set_n_cpu_devices(n: Optional[int] = None) -> None:
   n = n or FLAGS['chex_n_cpu_devices'].value
 
   n_devices = get_n_cpu_devices_from_xla_flags()
-  cpu_backend = (jax.lib.xla_bridge._backends or {}).get('cpu', None)  # pylint: disable=protected-access
+  cpu_backend = (jax._src.xla_bridge._backends or {}).get('cpu', None)  # pylint: disable=protected-access
   if cpu_backend is not None and n_devices != n:
     raise RuntimeError(
         f'Attempted to set {n} devices, but {n_devices} CPUs already available:'
@@ -86,11 +86,6 @@ def convert_to_varargs(sig, *args, **kwargs):
   """Converts varargs+kwargs function arguments into varargs only."""
   bound_args = sig.bind(*args, **kwargs)
   return bound_args.args
-
-
-@functools.wraps(jax.jit)
-def _fake_jit(fn, *unused_args, **unused_kwargs):
-  return fn
 
 
 def _ignore_axis_index_groups(fn):
@@ -153,18 +148,42 @@ def _fake_pmap(fn,
     call_args = convert_to_varargs(fn_signature, *args, **kwargs)
 
     if static_broadcasted_argnums:
+      # Make sure vmap does not try to map over `static_broadcasted_argnums`.
       if isinstance(in_axes, int):
-        vmap_in_axes = jax.tree_util.tree_map(lambda _: in_axes, call_args)
+        vmap_in_axes = [in_axes] * len(call_args)
       else:
-        vmap_in_axes = in_axes
-      vmap_in_axes = list(vmap_in_axes)
+        vmap_in_axes = list(in_axes)
       for argnum in static_broadcasted_argnums:
-        vmap_in_axes[argnum] = jax.tree_util.tree_map(
-            lambda _: None, call_args[argnum])
+        vmap_in_axes[argnum] = None
+
+      # To protect the arguments from `static_broadcasted_argnums`,
+      # from turning into tracers (because of vmap), we capture the original
+      # `call_args` and replace the passed in tracers with original values.
+      original_call_args = call_args
+
+      # A function passed to vmap, that will simply replace the static args
+      # with their original values.
+      def fn_without_statics(*args):
+        args_with_original_statics = [
+            orig_arg if i in static_broadcasted_argnums else arg
+            for i, (arg, orig_arg) in enumerate(zip(args, original_call_args))
+        ]
+        return fn(*args_with_original_statics)
+
+      # Make sure to avoid turning static args into tracers: Some python objects
+      # might not survive vmap. Just replace with an unused constant.
+      call_args = [
+          1 if i in static_broadcasted_argnums else arg
+          for i, arg in enumerate(call_args)
+      ]
+
     else:
       vmap_in_axes = in_axes
+      fn_without_statics = fn
 
-    vmapped_fn = jax.vmap(fn, in_axes=vmap_in_axes, axis_name=axis_name)
+    vmapped_fn = jax.vmap(
+        fn_without_statics, in_axes=vmap_in_axes, axis_name=axis_name
+    )
     if jit_result:
       vmapped_fn = jax.jit(vmapped_fn)
 
@@ -232,23 +251,7 @@ def fake_jit(enable_patching: bool = True) -> FakeContext:
     such as `jax.lax.scan`, etc.
   """
   stack = FakeContext()
-  if enable_patching:
-    stack.enter_context(mock.patch('jax.jit', _fake_jit))
-
-    # Some functions like jax.lax.scan also internally use jit. Most respect
-    # the config setting `jax_disable_jit` and replace its implementation
-    # with a dummy, jit-free one if the setting is one. Use this mechanism too.
-    @contextlib.contextmanager
-    def _jax_disable_jit():
-      original_value = jax.config.jax_disable_jit
-      jax.config.update('jax_disable_jit', True)
-      try:
-        yield
-      finally:
-        jax.config.update('jax_disable_jit', original_value)
-
-    stack.enter_context(_jax_disable_jit())
-
+  stack.enter_context(jax.disable_jit(disable=enable_patching))
   return stack
 
 
@@ -393,7 +396,7 @@ class OnCallOfTransformedFunction():
     """
     self._fn_transformation = fn_transformation
     self._callback_fn = callback_fn
-    self._patch = None
+    self._patch: mock._patch[Callable[[Any], Any]] = None  # pylint: disable=unsubscriptable-object
     self._original_fn_transformation = None
 
   def __enter__(self):
