@@ -12,33 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pytypes for arrays and scalars."""
+"""Type definitions to use for type annotations."""
 
-from typing import Any, Iterable, Mapping, Union
+from typing import Any, Iterable, Mapping, Sequence, Union
+
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-Array = jnp.ndarray
-ArrayBatched = jax.interpreters.batching.BatchTracer
+# Special types of arrays.
 ArrayNumpy = np.ndarray
-ArraySharded = jax.interpreters.pxla.ShardedDeviceArray
-# Use this type for type annotation. For instance checking,  use
-# `isinstance(x, jax.DeviceArray)`.
-# `jax.interpreters.xla._DeviceArray` appears in jax > 0.2.5
-if hasattr(jax.interpreters.xla, '_DeviceArray'):
-  ArrayDevice = jax.interpreters.xla._DeviceArray  # pylint:disable=protected-access
-else:
-  ArrayDevice = jax.interpreters.xla.DeviceArray
 
+# For instance checking, use `isinstance(x, jax.Array)`.
+ArrayDevice = jax.Array
+
+# Types for backward compatibility.
+ArraySharded = jax.Array
+ArrayBatched = jax.Array
+
+# Generic array type.
+# Similar to `jax.typing.ArrayLike` but does not accept python scalar types.
+Array = Union[
+    ArrayDevice,
+    ArrayBatched,
+    ArraySharded,  # JAX array type
+    ArrayNumpy,  # NumPy array type
+    np.bool_,
+    np.number,  # NumPy scalar types
+]
+
+# A tree of generic arrays.
+ArrayTree = Union[Array, Iterable['ArrayTree'], Mapping[Any, 'ArrayTree']]
+ArrayDeviceTree = Union[
+    ArrayDevice, Iterable['ArrayDeviceTree'], Mapping[Any, 'ArrayDeviceTree']
+]
+ArrayNumpyTree = Union[
+    ArrayNumpy, Iterable['ArrayNumpyTree'], Mapping[Any, 'ArrayNumpyTree']
+]
+
+# Other types.
 Scalar = Union[float, int]
 Numeric = Union[Array, Scalar]
-PRNGKey = jax.random.KeyArray
-PyTreeDef = type(jax.tree_util.tree_structure(None))
-Shape = jax.core.Shape
+Shape = Sequence[Union[int, Any]]
+PRNGKey = jax.Array
+PyTreeDef = jax.tree_util.PyTreeDef
+Device = jax.Device
 
-Device = jax.lib.xla_extension.Device
-
-ArrayTree = Union[Array, Iterable['ArrayTree'], Mapping[Any, 'ArrayTree']]
-
-ArrayDType = Any
+# TODO(iukemaev, jakevdp): upgrade minimum jax version & remove this condition.
+if hasattr(jax.typing, 'DTypeLike'):
+  # jax version 0.4.19 or newer
+  ArrayDType = jax.typing.DTypeLike  # pylint:disable=invalid-name
+else:
+  ArrayDType = Any  # pylint:disable=invalid-name

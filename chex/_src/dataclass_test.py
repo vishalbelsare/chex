@@ -13,19 +13,30 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for `dataclass.py`."""
+
+# pytype: disable=wrong-keyword-args  # dataclass_transform
+
 import copy
 import dataclasses
+import pickle
 import sys
-from typing import Any, Mapping, TypeVar, Generic
+from typing import Any, Generic, Mapping, TypeVar
+import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from chex._src import asserts
 from chex._src import dataclass
 from chex._src import pytypes
+import cloudpickle
 import jax
 import numpy as np
-import tree
+
+# dm-tree is not compatible with Python 3.13.
+try:
+  import tree  # pylint:disable=g-import-not-at-top
+except ImportError:
+  tree = None
 
 chex_dataclass = dataclass.dataclass
 mappable_dataclass = dataclass.mappable_dataclass
@@ -36,6 +47,22 @@ orig_dataclass = dataclasses.dataclass
 class NestedDataclass():
   c: pytypes.ArrayDevice
   d: pytypes.ArrayDevice
+
+
+@chex_dataclass
+class PostInitDataclass:
+  a: pytypes.ArrayDevice
+
+  def __post_init__(self):
+    if not self.a > 0:
+      raise ValueError('a should be > than 0')
+
+
+@chex_dataclass
+class ReverseOrderNestedDataclass():
+  # The order of c and d are switched comapred to NestedDataclass.
+  d: pytypes.ArrayDevice
+  c: pytypes.ArrayDevice
 
 
 @chex_dataclass
@@ -57,6 +84,16 @@ def dummy_dataclass(factor=1., frozen=False):
           c=factor * np.ones((3,), dtype=np.float32),
           d=factor * np.ones((4,), dtype=np.float32)),
       b=factor * 2 * np.ones((5,), dtype=np.float32))
+
+
+def _dataclass_instance_fields(dcls_instance):
+  """Serialization-friendly version of dataclasses.fields for instances."""
+  attribute_dict = dcls_instance.__dict__
+  fields = []
+  for field in dcls_instance.__dataclass_fields__.values():
+    if field.name in attribute_dict:  # Filter pseudo-fields.
+      fields.append(field)
+  return fields
 
 
 @orig_dataclass
@@ -88,10 +125,10 @@ def _get_mappable_dataclasses(test_type):
     k_arr: np.ndarray
     k_dclass_with_map: Class
     k_dclass_no_map: ClassWithoutMap
-    k_dict_factory: dict = dataclasses.field(  # pylint:disable=g-bare-generic
+    k_dict_factory: dict = dataclasses.field(  # pylint:disable=g-bare-generic,invalid-field-call
         default_factory=lambda: dict(x='x', y='y'))
     k_default: str = 'default_str'
-    k_non_init: int = dataclasses.field(default=1, init=False)
+    k_non_init: int = dataclasses.field(default=1, init=False)  # pylint:disable=g-bare-generic,invalid-field-call
     k_init_only: dataclasses.InitVar[int] = 10
 
     def some_method(self, *args):
@@ -178,7 +215,9 @@ class MappableDataclassTest(parameterized.TestCase):
     self.dcls_tree_size = 18
     self.dcls_tree_size_no_dicts = 14
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testFlattenAndUnflatten(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     self.assertEqual(self.dcls_flattened, tree.flatten(self.dcls_with_map))
@@ -192,21 +231,27 @@ class MappableDataclassTest(parameterized.TestCase):
     self.assertEqual(dataclass_in_seq,
                      tree.unflatten_as(dataclass_in_seq, dataclass_in_seq_flat))
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testFlattenUpTo(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
     structure = copy.copy(self.dcls_with_map)
     structure.k_dclass_with_map = None  # Do not flatten 'k_dclass_with_map'
     self.assertEqual(self.dcls_flattened_up_to,
                      tree.flatten_up_to(structure, self.dcls_with_map))
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testFlattenWithPath(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     self.assertEqual(
         tree.flatten_with_path(self.dcls_with_map),
         self.dcls_flattened_with_path)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testFlattenWithPathUpTo(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
     structure = copy.copy(self.dcls_with_map)
     structure.k_dclass_with_map = None  # Do not flatten 'k_dclass_with_map'
@@ -214,7 +259,9 @@ class MappableDataclassTest(parameterized.TestCase):
         tree.flatten_with_path_up_to(structure, self.dcls_with_map),
         self.dcls_flattened_with_path_up_to)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testMapStructure(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     add_one_to_ints_fn = lambda x: x + 1 if isinstance(x, int) else x
@@ -225,7 +272,9 @@ class MappableDataclassTest(parameterized.TestCase):
                      self.dcls_with_map_inc_ints.k_int * 10)
     self.assertEqual(mapped_inc_ints.k_non_init, mapped_inc_ints.k_int * 10)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testMapStructureUpTo(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     structure = copy.copy(self.dcls_with_map)
@@ -242,7 +291,9 @@ class MappableDataclassTest(parameterized.TestCase):
                      self.dcls_with_map_inc_ints.k_int * 10)
     self.assertEqual(mapped_inc_ints.k_non_init, mapped_inc_ints.k_int * 10)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testMapStructureWithPath(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     add_one_to_ints_fn = lambda path, x: x + 1 if isinstance(x, int) else x
@@ -254,7 +305,9 @@ class MappableDataclassTest(parameterized.TestCase):
                      self.dcls_with_map_inc_ints.k_int * 10)
     self.assertEqual(mapped_inc_ints.k_non_init, mapped_inc_ints.k_int * 10)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testMapStructureWithPathUpTo(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     structure = copy.copy(self.dcls_with_map)
@@ -272,7 +325,9 @@ class MappableDataclassTest(parameterized.TestCase):
                      self.dcls_with_map_inc_ints.k_int * 10)
     self.assertEqual(mapped_inc_ints.k_non_init, mapped_inc_ints.k_int * 10)
 
+  @unittest.skipIf(tree is None, 'dm-tree is not compatible with Python 3.13')
   def testTraverse(self, test_type):
+    assert tree is not None
     self._init_testdata(test_type)
 
     visited = []
@@ -314,15 +369,107 @@ class DataclassesTest(parameterized.TestCase):
     asserts.assert_trees_all_close(
         jax.tree_util.tree_map(lambda t: factor * t, obj), target_obj)
 
+  def test_tree_flatten_with_keys(self):
+    obj = dummy_dataclass()
+    keys_and_leaves, treedef = jax.tree_util.tree_flatten_with_path(obj)
+    self.assertEqual(
+        [k for k, _ in keys_and_leaves],
+        [
+            (jax.tree_util.GetAttrKey('a'), jax.tree_util.GetAttrKey('c')),
+            (jax.tree_util.GetAttrKey('a'), jax.tree_util.GetAttrKey('d')),
+            (jax.tree_util.GetAttrKey('b'),),
+        ],
+    )
+    leaves = [l for _, l in keys_and_leaves]
+    new_obj = treedef.unflatten(leaves)
+    asserts.assert_trees_all_equal(new_obj, obj)
+
+  def test_tree_map_with_keys(self):
+    obj = dummy_dataclass()
+    key_value_list, unused_treedef = jax.tree_util.tree_flatten_with_path(obj)
+    # Convert a list of key-value tuples to a dict.
+    flat_obj = dict(key_value_list)
+
+    def f(path, x):
+      value = flat_obj[path]
+      np.testing.assert_allclose(value, x)
+      return path
+
+    out = jax.tree_util.tree_map_with_path(f, obj)
+    self.assertEqual(
+        out.a.c, (jax.tree_util.GetAttrKey('a'), jax.tree_util.GetAttrKey('c'))
+    )
+    self.assertEqual(
+        out.a.d, (jax.tree_util.GetAttrKey('a'), jax.tree_util.GetAttrKey('d'))
+    )
+    self.assertEqual(out.b, (jax.tree_util.GetAttrKey('b'),))
+
+  def test_tree_map_with_keys_traversal_order(self):
+    # pytype: disable=wrong-arg-types
+    obj = ReverseOrderNestedDataclass(d=1, c=2)
+    # pytype: enable=wrong-arg-types
+    leaves = []
+    def f(_, x):
+      leaves.append(x)
+
+    jax.tree_util.tree_map_with_path(f, obj)
+    self.assertEqual(leaves, jax.tree_util.tree_leaves(obj))
+
   @parameterized.parameters([True, False])
   def test_dataclass_replace(self, frozen):
     factor = 5.
     obj = dummy_dataclass(frozen=frozen)
+    # pytype: disable=attribute-error  # dataclass_transform
     obj = obj.replace(a=obj.a.replace(c=factor * obj.a.c))
     obj = obj.replace(a=obj.a.replace(d=factor * obj.a.d))
     obj = obj.replace(b=factor * obj.b)
     target_obj = dummy_dataclass(factor=factor, frozen=frozen)
     asserts.assert_trees_all_close(obj, target_obj)
+    # pytype: enable=attribute-error
+
+  def test_dataclass_requires_kwargs_by_default(self):
+    factor = 1.0
+    with self.assertRaisesRegex(
+        ValueError,
+        "Mappable dataclass constructor doesn't support positional args.",
+    ):
+      Dataclass(
+          NestedDataclass(
+              c=factor * np.ones((3,), dtype=np.float32),
+              d=factor * np.ones((4,), dtype=np.float32),
+          ),
+          factor * 2 * np.ones((5,), dtype=np.float32),
+      )
+
+  def test_dataclass_mappable_dataclass_false(self):
+    factor = 1.0
+
+    @chex_dataclass(mappable_dataclass=False)
+    class NonMappableDataclass:
+      a: NestedDataclass
+      b: pytypes.ArrayDevice
+
+    NonMappableDataclass(
+        NestedDataclass(
+            c=factor * np.ones((3,), dtype=np.float32),
+            d=factor * np.ones((4,), dtype=np.float32),
+        ),
+        factor * 2 * np.ones((5,), dtype=np.float32),
+    )
+
+  def test_inheritance_is_possible_thanks_to_kw_only(self):
+    if sys.version_info.minor < 10:  # Feature only available for Python >= 3.10
+      return
+
+    @chex_dataclass(kw_only=True)
+    class Base:
+      default: int = 1
+
+    @chex_dataclass(kw_only=True)
+    class Child(Base):
+      non_default: int
+
+    Child(non_default=2)
 
   def test_unfrozen_dataclass_is_mutable(self):
     factor = 5.
@@ -352,9 +499,9 @@ class DataclassesTest(parameterized.TestCase):
       data: int = 1
 
     obj_a = SimpleClass(data=1)
-    state = obj_a.__getstate__()
+    state = getattr(obj_a, '__getstate__')()
     obj_b = SimpleClass(data=2)
-    obj_b.__setstate__(state)
+    getattr(obj_b, '__setstate__')(state)
     self.assertEqual(obj_a, obj_b)
 
   def test_unexpected_kwargs(self):
@@ -366,7 +513,7 @@ class DataclassesTest(parameterized.TestCase):
 
     SimpleDataclass(a=1, b=3)
     with self.assertRaisesRegex(ValueError, 'init.*got unexpected kwargs'):
-      SimpleDataclass(a=1, b=3, c=4)
+      SimpleDataclass(a=1, b=3, c=4)  # pytype: disable=wrong-keyword-args
 
   def test_tuple_conversion(self):
 
@@ -376,9 +523,9 @@ class DataclassesTest(parameterized.TestCase):
       a: int
 
     obj = SimpleDataclass(a=2, b=1)
-    self.assertSequenceEqual(obj.to_tuple(), (1, 2))
+    self.assertSequenceEqual(getattr(obj, 'to_tuple')(), (1, 2))
 
-    obj2 = SimpleDataclass.from_tuple((1, 2))
+    obj2 = getattr(SimpleDataclass, 'from_tuple')((1, 2))
     self.assertEqual(obj.a, obj2.a)
     self.assertEqual(obj.b, obj2.b)
 
@@ -388,7 +535,10 @@ class DataclassesTest(parameterized.TestCase):
   )
   def test_tuple_rev_conversion(self, frozen):
     obj = dummy_dataclass(frozen=frozen)
-    asserts.assert_trees_all_close(type(obj).from_tuple(obj.to_tuple()), obj)
+    asserts.assert_trees_all_close(
+        type(obj).from_tuple(obj.to_tuple()),  # pytype: disable=attribute-error
+        obj,
+    )
 
   @parameterized.named_parameters(
       ('frozen', True),
@@ -490,20 +640,32 @@ class DataclassesTest(parameterized.TestCase):
         (dcls.str_val, dcls.inner_dcls, dcls.dct['md1'], dcls.dct['md2']),
         leaves)
 
-    asserts.assert_tree_all_equal_structs(
+    asserts.assert_trees_all_equal_structs(
         jax.tree_util.tree_map(lambda x: x, dcls, is_leaf=_is_leaf), dcls)
+
+  def test_decorator_alias(self):
+    # Make sure, that creating a decorator alias works correctly.
+    configclass = chex_dataclass(frozen=True)
+
+    @configclass
+    class Foo:
+      bar: int = 1
+      toto: int = 2
+
+    @configclass
+    class Bar:
+      bar: int = 1
+      toto: int = 2
+
+    # Verify that both Foo and Bar are correctly registered with jax.tree_util.
+    self.assertLen(jax.tree_util.tree_flatten(Foo())[0], 2)
+    self.assertLen(jax.tree_util.tree_flatten(Bar())[0], 2)
 
   @parameterized.named_parameters(
       ('mappable', True),
       ('not_mappable', False),
   )
   def test_generic_dataclass(self, mappable):
-    # Running under Python 3.6 results in error "TypeError: Cannot inherit from
-    # plain Generic", I'm speculating that this is a bug in cpython since
-    # subsequent versions work
-    if sys.version_info < (3, 7):
-      self.skipTest('Skip test on Python version < 3.7')
-
     T = TypeVar('T')
 
     @chex_dataclass(mappable_dataclass=mappable)
@@ -511,7 +673,7 @@ class DataclassesTest(parameterized.TestCase):
       a: T  # pytype: disable=invalid-annotation  # enable-bare-annotations
 
     obj = GenericDataclass(a=np.array([1.0, 1.0]))
-    asserts.assert_tree_all_close(obj.a, 1.0)
+    asserts.assert_trees_all_close(obj.a, 1.0)
 
   def test_mappable_eq_override(self):
 
@@ -529,6 +691,71 @@ class DataclassesTest(parameterized.TestCase):
     obj3 = EqDataclass(a=np.array([0.0, 1.0]))
     self.assertEqual(obj1, obj2)
     self.assertNotEqual(obj1, obj3)
+
+  @parameterized.parameters([NestedDataclass, ReverseOrderNestedDataclass])
+  def test_dataclass_instance_fields(self, dcls):
+    obj = dcls(c=1, d=2)
+    self.assertSequenceEqual(
+        dataclasses.fields(obj), _dataclass_instance_fields(obj))
+
+  @parameterized.parameters((pickle, NestedDataclass),
+                            (cloudpickle, ReverseOrderNestedDataclass))
+  def test_roundtrip_serialization(self, serialization_lib, dcls):
+    obj = dcls(c=1, d=2)
+    obj_fields = [
+        (f.name, getattr(obj, f.name)) for f in dataclasses.fields(obj)
+    ]
+    self.assertLen(obj_fields, 2)
+    obj2 = serialization_lib.loads(serialization_lib.dumps(obj))
+    obj2_fields = [(f.name, getattr(obj2, f.name))
+                   for f in _dataclass_instance_fields(obj2)]
+    self.assertSequenceEqual(obj_fields, obj2_fields)
+    self.assertSequenceEqual(jax.tree_util.tree_leaves(obj2), [1, 2])
+
+    obj3 = jax.tree_util.tree_map(lambda x: x, obj2)
+    obj3_fields = [(f.name, getattr(obj3, f.name))
+                   for f in _dataclass_instance_fields(obj3)]
+    self.assertSequenceEqual(obj_fields, obj3_fields)
+    self.assertSequenceEqual(jax.tree_util.tree_leaves(obj3), [1, 2])
+
+  @parameterized.parameters([NestedDataclass, ReverseOrderNestedDataclass])
+  def test_flatten_roundtrip_ordering(self, dcls):
+    obj = dcls(c=1, d=2)
+    leaves, treedef = jax.tree_util.tree_flatten(obj)
+    self.assertSequenceEqual(leaves, [1, 2])
+    obj2 = jax.tree_util.tree_unflatten(treedef, leaves)
+    self.assertSequenceEqual(dataclasses.fields(obj2), dataclasses.fields(obj))
+
+  def test_flatten_respects_post_init(self):
+    obj = PostInitDataclass(a=1)  # pytype: disable=wrong-arg-types
+    with self.assertRaises(ValueError):
+      _ = jax.tree_util.tree_map(lambda x: 0, obj)
+
+  @parameterized.parameters([False, True])
+  def test_keys_and_values_type(self, frozen):
+    obj = dummy_dataclass(frozen=frozen)
+    self.assertEqual(
+        type(obj.keys()),  # pytype: disable=attribute-error
+        type({}.keys()),
+    )
+    self.assertEqual(
+        type(obj.values()),  # pytype: disable=attribute-error
+        type({}.values()),
+    )
+
+  @parameterized.parameters([False, True])
+  def test_keys_and_values_override(self, frozen):
+    @chex_dataclass(frozen=frozen)
+    class _Dataclass:
+      x: int
+      values: int
+
+    obj = _Dataclass(x=1, values=2)
+    self.assertEqual(
+        list(obj.keys()),  # pytype: disable=attribute-error
+        ['x', 'values'],
+    )
+    self.assertEqual(obj.values, 2)
 
 
 if __name__ == '__main__':

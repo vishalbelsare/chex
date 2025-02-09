@@ -17,9 +17,11 @@
 import collections
 import dataclasses
 import functools
+import sys
 
 from absl import logging
 import jax
+from typing_extensions import dataclass_transform  # pytype: disable=not-supported-yet
 
 
 FrozenInstanceError = dataclasses.FrozenInstanceError
@@ -47,6 +49,12 @@ def mappable_dataclass(cls):
   setattr(cls, "__getitem__", lambda self, x: self.__dict__[x])
   setattr(cls, "__len__", lambda self: len(self.__dict__))
   setattr(cls, "__iter__", lambda self: iter(self.__dict__))
+  # Override the default `collections.abc.Mapping` method implementation for
+  # cleaner visualization. Without this change x.keys() shows the full repr(x)
+  # instead of only the dict_keys present. The same goes for values and items.
+  setattr(cls, "keys", lambda self: self.__dict__.keys())
+  setattr(cls, "values", lambda self: self.__dict__.values())
+  setattr(cls, "items", lambda self: self.__dict__.items())
 
   # Update constructor.
   orig_init = cls.__init__
@@ -82,6 +90,7 @@ def mappable_dataclass(cls):
   return cls
 
 
+@dataclass_transform()
 def dataclass(
     cls=None,
     *,
@@ -91,6 +100,7 @@ def dataclass(
     order=False,
     unsafe_hash=False,
     frozen=False,
+    kw_only: bool = False,
     mappable_dataclass=True,  # pylint: disable=redefined-outer-name
 ):
   """JAX-friendly wrapper for :py:func:`dataclasses.dataclass`.
@@ -107,6 +117,7 @@ def dataclass(
     order: See :py:func:`dataclasses.dataclass`.
     unsafe_hash: See :py:func:`dataclasses.dataclass`.
     frozen: See :py:func:`dataclasses.dataclass`.
+    kw_only: See :py:func:`dataclasses.dataclass`.
     mappable_dataclass: If True (the default), methods to make the class
       implement the :py:class:`collections.abc.Mapping` interface will be
       generated and the class will include :py:class:`collections.abc.Mapping`
@@ -121,8 +132,12 @@ def dataclass(
   Returns:
     A JAX-friendly dataclass.
   """
-  dcls = _Dataclass(init, repr, eq, order, unsafe_hash, frozen,
-                    mappable_dataclass)
+  def dcls(cls):
+    # Make sure to create a separate _Dataclass instance for each `cls`.
+    return _Dataclass(
+        init, repr, eq, order, unsafe_hash, frozen, kw_only, mappable_dataclass
+    )(cls)
+
   if cls is None:
     return dcls
   return dcls(cls)
@@ -139,6 +154,7 @@ class _Dataclass():
       order=False,
       unsafe_hash=False,
       frozen=False,
+      kw_only=False,
       mappable_dataclass=True,  # pylint: disable=redefined-outer-name
   ):
     self.init = init
@@ -147,8 +163,8 @@ class _Dataclass():
     self.order = order
     self.unsafe_hash = unsafe_hash
     self.frozen = frozen
+    self.kw_only = kw_only
     self.mappable_dataclass = mappable_dataclass
-    self.registered = False
 
   def __call__(self, cls):
     """Forwards class to dataclasses's wrapper and registers it with JAX."""
@@ -159,6 +175,11 @@ class _Dataclass():
           getattr(base, "__dataclass_params__").frozen and not self.frozen):
         raise TypeError("cannot inherit non-frozen dataclass from a frozen one")
 
+    # `kw_only` is only available starting from 3.10.
+    version_dependent_args = {}
+    version = sys.version_info
+    if version.major == 3 and version.minor >= 10:
+      version_dependent_args = {"kw_only": self.kw_only}
     # pytype: disable=wrong-keyword-args
     dcls = dataclasses.dataclass(
         cls,
@@ -167,7 +188,9 @@ class _Dataclass():
         eq=self.eq,
         order=self.order,
         unsafe_hash=self.unsafe_hash,
-        frozen=self.frozen)
+        frozen=self.frozen,
+        **version_dependent_args,
+    )
     # pytype: enable=wrong-keyword-args
 
     fields_names = set(f.name for f in dataclasses.fields(dcls))
@@ -178,11 +201,6 @@ class _Dataclass():
 
     if self.mappable_dataclass:
       dcls = mappable_dataclass(dcls)
-      # We remove `collection.abc.Mapping` mixin methods here to allow
-      # fields with these names.
-      for attr in ("values", "keys", "get", "items"):
-        setattr(dcls, attr, None)  # redefine
-        delattr(dcls, attr)        # delete
 
     def _from_tuple(args):
       return dcls(zip(dcls.__dataclass_fields__.keys(), args))
@@ -196,24 +214,39 @@ class _Dataclass():
     def _getstate(self):
       return self.__dict__
 
-    class_self = self
+    # Register the dataclass at definition. As long as the dataclass is defined
+    # outside __main__, this is sufficient to make JAX's PyTree registry
+    # recognize the dataclass and the dataclass' custom PyTreeDef, especially
+    # when unpickling either the dataclass object, its type, or its PyTreeDef,
+    # in a different process, because the defining module will be imported.
+    #
+    # However, if the dataclass is defined in __main__, unpickling in a
+    # subprocess does not trigger re-registration. Therefore we also need to
+    # register when deserializing the object, or construction (e.g. when the
+    # dataclass type is being unpickled). Unfortunately, there is not yet a way
+    # to trigger re-registration when the treedef is unpickled as that's handled
+    # by JAX.
+    #
+    # See internal dataclass_test for unit tests demonstrating the problems.
+    # The registration below may result in pickling failures of the sort
+    # _pickle.PicklingError: Can't pickle <functools._lru_cache_wrapper object>:
+    # it's not the same object as register_dataclass_type_with_jax_tree_util
+    # for modules defined in __main__ so we disable registration in this case.
+    if dcls.__module__ != "__main__":
+      register_dataclass_type_with_jax_tree_util(dcls)
 
-    # Patch __setstate__ to register the object on deserialization.
+    # Patch __setstate__ to register the dataclass on deserialization.
     def _setstate(self, state):
-      if not class_self.registered:
-        register_dataclass_type_with_jax_tree_util(dcls)
-        class_self.registered = True
+      register_dataclass_type_with_jax_tree_util(dcls)
       self.__dict__.update(state)
 
     orig_init = dcls.__init__
 
-    # Patch object's __init__ such that the class is registered on creation if
-    # it is not registered on deserialization.
+    # Patch __init__ such that the dataclass is registered on creation if it is
+    # not registered on deserialization.
     @functools.wraps(orig_init)
     def _init(self, *args, **kwargs):
-      if not class_self.registered:
-        register_dataclass_type_with_jax_tree_util(dcls)
-        class_self.registered = True
+      register_dataclass_type_with_jax_tree_util(dcls)
       return orig_init(self, *args, **kwargs)
 
     setattr(dcls, "from_tuple", _from_tuple)
@@ -226,6 +259,33 @@ class _Dataclass():
     return dcls
 
 
+def _dataclass_unflatten(dcls, keys, values):
+  """Creates a chex dataclass from a flatten jax.tree_util representation."""
+  dcls_object = dcls.__new__(dcls)
+  attribute_dict = dict(zip(keys, values))
+  # Looping over fields instead of keys & values preserves the field order.
+  # Using dataclasses.fields fails because dataclass uids change after
+  # serialisation (eg, with cloudpickle).
+  for field in dcls.__dataclass_fields__.values():
+    if field.name in attribute_dict:  # Filter pseudo-fields.
+      object.__setattr__(dcls_object, field.name, attribute_dict[field.name])
+  # Need to manual call post_init here as we have avoided calling __init__
+  if getattr(dcls_object, "__post_init__", None):
+    dcls_object.__post_init__()
+  return dcls_object
+
+
+def _flatten_with_path(dcls):
+  path = []
+  keys = []
+  for k, v in sorted(dcls.__dict__.items()):
+    keys.append(k)  # generate same aux data as flatten without path
+    k = jax.tree_util.GetAttrKey(k)
+    path.append((k, v))
+  return path, tuple(keys)
+
+
+@functools.cache
 def register_dataclass_type_with_jax_tree_util(data_class):
   """Register an existing dataclass so JAX knows how to handle it.
 
@@ -240,9 +300,10 @@ def register_dataclass_type_with_jax_tree_util(data_class):
       in instance.__dict__.
   """
   flatten = lambda d: jax.util.unzip2(sorted(d.__dict__.items()))[::-1]
-  unflatten = lambda keys, values: data_class(**dict(zip(keys, values)))
+  unflatten = functools.partial(_dataclass_unflatten, data_class)
   try:
-    jax.tree_util.register_pytree_node(
-        nodetype=data_class, flatten_func=flatten, unflatten_func=unflatten)
+    jax.tree_util.register_pytree_with_keys(
+        nodetype=data_class, flatten_with_keys=_flatten_with_path,
+        flatten_func=flatten, unflatten_func=unflatten)
   except ValueError:
     logging.info("%s is already registered as JAX PyTree node.", data_class)

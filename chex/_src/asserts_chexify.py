@@ -17,17 +17,33 @@
 import atexit
 import collections
 from concurrent import futures
+import dataclasses
 import functools
 import re
-from typing import Any, Callable
+from typing import Any, Callable, FrozenSet
 
 from absl import logging
 from chex._src import asserts_internal as _ai
 import jax
 from jax.experimental import checkify
 
+
+@dataclasses.dataclass(frozen=True)
+class _ChexifyChecks:
+  """A set of checks imported from checkify."""
+
+  user: FrozenSet[checkify.ErrorCategory] = checkify.user_checks
+  nan: FrozenSet[checkify.ErrorCategory] = checkify.nan_checks
+  index: FrozenSet[checkify.ErrorCategory] = checkify.index_checks
+  div: FrozenSet[checkify.ErrorCategory] = checkify.div_checks
+  float: FrozenSet[checkify.ErrorCategory] = checkify.float_checks
+  automatic: FrozenSet[checkify.ErrorCategory] = checkify.automatic_checks
+  all: FrozenSet[checkify.ErrorCategory] = checkify.all_checks
+
+
 _chexify_error_pattern = re.compile(
-    re.escape(_ai.get_chexify_err_message('NAME')).replace('NAME', '.*'))
+    re.escape(_ai.get_chexify_err_message('ANY', 'ANY')).replace('ANY', '.*')
+)
 
 
 def _check_error(err: checkify.Error) -> None:
@@ -59,15 +75,22 @@ def block_until_chexify_assertions_complete() -> None:
 def _check_if_hanging_assertions():
   if _ai.CHEXIFY_STORAGE.wait_fns:
     logging.warning(
-        '[Chex] Some of chexify assetion statuses were not inspected due to '
+        '[Chex] Some of chexify assertion statuses were not inspected due to '
         'async exec (https://jax.readthedocs.io/en/latest/async_dispatch.html).'
         ' Consider calling `chex.block_until_chexify_assertions_complete()` at '
-        'the end of computations that rely on jitted chex assetions.')
+        'the end of computations that rely on jitted chex assertions.')
     block_until_chexify_assertions_complete()
 
 
-def chexify(fn: Callable[..., Any],
-            async_check: bool = True) -> Callable[..., Any]:
+# Public API.
+ChexifyChecks = _ChexifyChecks()
+
+
+def chexify(
+    fn: Callable[..., Any],
+    async_check: bool = True,
+    errors: FrozenSet[checkify.ErrorCategory] = ChexifyChecks.user,
+) -> Callable[..., Any]:
   """Wraps a transformed function `fn` to enable Chex value assertions.
 
   Chex value/runtime assertions access concrete values of tensors (e.g.
@@ -127,6 +150,11 @@ def chexify(fn: Callable[..., Any],
     fn: A transformed function to wrap.
     async_check: Whether to check errors in the async dispatch mode. See
       https://jax.readthedocs.io/en/latest/async_dispatch.html.
+    errors: A set of `checkify.ErrorCategory` values which defines the set of
+      enabled checks. By default only explicit ``checks`` are enabled (`user`).
+      You can also for example enable NaN and Div-by-0 errors by passing the
+      `float` set, or for example combine multiple sets through set
+      operations (`float | user`).
 
   Returns:
     A _chexified_ function, i.e. the one with enabled value assertions.
@@ -139,14 +167,20 @@ def chexify(fn: Callable[..., Any],
   # ensure that a program never blocks on Chex side when running in async mode.
   async_timeout = 1800  # 30 minutes
 
+  # Get function name.
+  if isinstance(fn, functools.partial):
+    func_name = fn.func.__name__
+  else:
+    func_name = fn.__name__
+
   if async_check:
     # Spawn a thread for processing blocking calls.
-    thread_pool = futures.ThreadPoolExecutor(1, f'async_chex_{fn.__name__}')
+    thread_pool = futures.ThreadPoolExecutor(1, f'async_chex_{func_name}')
     # A deque for futures.
     async_check_futures = collections.deque()
 
   # Checkification.
-  checkified_fn = checkify.checkify(fn)
+  checkified_fn = checkify.checkify(fn, errors=errors)
 
   @functools.wraps(fn)
   def _chexified_fn(*args, **kwargs):
@@ -154,6 +188,16 @@ def chexify(fn: Callable[..., Any],
       raise RuntimeError(
           'Nested @chexify wrapping is disallowed. '
           'Make sure that you only wrap the function at the outermost level.')
+
+    if _ai.has_tracers((args, kwargs)):
+      raise RuntimeError(
+          '@chexify must be applied on top of all (p)jit/pmap transformations'
+          ' (otherwise it will result in `UnexpectedTracerError`). If you have'
+          ' functions that use value assertions, do not wrap them'
+          ' individually -- just wrap the outermost function after'
+          ' applying all your JAX transformations. See the example at '
+          'https://github.com/google-deepmind/chex#static-and-value-aka-runtime-assertions'  # pylint:disable=line-too-long
+      )
 
     if async_check:
       # Check completed calls.
@@ -192,7 +236,7 @@ def chexify(fn: Callable[..., Any],
   else:
     logging.warning(
         "Function %s already defines 'wait_checks' method; "
-        'Chex will not redefine it.', _chexified_fn.__name__)
+        'Chex will not redefine it.', func_name)
 
   return _chexified_fn
 

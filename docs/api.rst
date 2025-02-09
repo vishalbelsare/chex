@@ -14,6 +14,7 @@ Assertions
     assert_devices_available
     assert_equal
     assert_equal_rank
+    assert_equal_size
     assert_equal_shape
     assert_equal_shape_prefix
     assert_equal_shape_suffix
@@ -30,6 +31,7 @@ Assertions
     assert_scalar_negative
     assert_scalar_non_negative
     assert_scalar_positive
+    assert_size
     assert_shape
     assert_tpu_available
     assert_tree_all_finite
@@ -41,13 +43,17 @@ Assertions
     assert_tree_shape_prefix
     assert_tree_shape_suffix
     assert_trees_all_close
+    assert_trees_all_close_ulp
     assert_trees_all_equal
     assert_trees_all_equal_comparator
     assert_trees_all_equal_dtypes
+    assert_trees_all_equal_sizes
     assert_trees_all_equal_shapes
+    assert_trees_all_equal_shapes_and_dtypes
     assert_trees_all_equal_structs
     assert_type
     chexify
+    ChexifyChecks
     with_jittable_assertions
     block_until_chexify_assertions_complete
     Dimensions
@@ -70,6 +76,7 @@ Value (Runtime) Assertions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autofunction:: chexify
+.. autosummary::  ChexifyChecks
 .. autofunction:: with_jittable_assertions
 .. autofunction:: block_until_chexify_assertions_complete
 
@@ -86,10 +93,13 @@ Tree Assertions
 .. autofunction:: assert_tree_shape_prefix
 .. autofunction:: assert_tree_shape_suffix
 .. autofunction:: assert_trees_all_close
+.. autofunction:: assert_trees_all_close_ulp
 .. autofunction:: assert_trees_all_equal
 .. autofunction:: assert_trees_all_equal_comparator
 .. autofunction:: assert_trees_all_equal_dtypes
+.. autofunction:: assert_trees_all_equal_sizes
 .. autofunction:: assert_trees_all_equal_shapes
+.. autofunction:: assert_trees_all_equal_shapes_and_dtypes
 .. autofunction:: assert_trees_all_equal_structs
 
 
@@ -104,6 +114,7 @@ Generic Assertions
 .. autofunction:: assert_axis_dimension_lteq
 .. autofunction:: assert_equal
 .. autofunction:: assert_equal_rank
+.. autofunction:: assert_equal_size
 .. autofunction:: assert_equal_shape
 .. autofunction:: assert_equal_shape_prefix
 .. autofunction:: assert_equal_shape_suffix
@@ -118,6 +129,7 @@ Generic Assertions
 .. autofunction:: assert_scalar_negative
 .. autofunction:: assert_scalar_non_negative
 .. autofunction:: assert_scalar_positive
+.. autofunction:: assert_size
 .. autofunction:: assert_shape
 .. autofunction:: assert_type
 
@@ -135,6 +147,17 @@ Utils
 .. autofunction:: enable_asserts
 .. autofunction:: clear_trace_counter
 .. autofunction:: if_args_not_none
+
+
+Warnings
+==========
+
+.. currentmodule:: chex
+
+.. autofunction:: create_deprecated_function_alias
+.. autofunction:: warn_deprecated_function
+.. autofunction:: warn_keyword_args_only_in_future
+.. autofunction:: warn_only_n_pos_args_in_future
 
 
 Backend restriction
@@ -191,8 +214,10 @@ Pytypes
     Array
     ArrayBatched
     ArrayDevice
+    ArrayDeviceTree
     ArrayDType
     ArrayNumpy
+    ArrayNumpyTree
     ArraySharded
     ArrayTree
     Device
